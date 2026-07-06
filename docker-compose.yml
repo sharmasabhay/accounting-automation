@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: omakase_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: omakase
+      POSTGRES_PASSWORD: omakase_secret
+      POSTGRES_DB: omakase_accounting
+    ports:
+      - "5432:5432"
+    volumes:
+      - omakase_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U omakase -d omakase_accounting"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: omakase_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - omakase_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  omakase_pg_data:
+  omakase_redis_data:

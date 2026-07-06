@@ -1,0 +1,392 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum WorkflowType {
+  PO_INTAKE
+  INVOICE_CAPTURE
+  RECONCILIATION
+  PAYMENT_EXECUTION
+}
+
+enum WorkflowStatus {
+  PENDING
+  IN_PROGRESS
+  AWAITING_APPROVAL
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+enum ApprovalGateType {
+  SKU_CLARIFICATION
+  SUPPLIER_CLARIFICATION
+  PO_MODIFICATION
+  NEW_PO_PRICE
+  FIELD_CONFIRMATION
+  SKU_MAPPING_CONFIRMATION
+  DISCREPANCY_RESOLUTION
+  CREATE_PO_FROM_INVOICE
+  RECONCILIATION_SOURCE_CHOICE
+  NEW_SOA_DETECTION
+  MISMATCH_RESOLUTION
+  PRIOR_BALANCE_SCOPE
+  ORDER_RECEIVED_CONFIRMATION
+  DBS_STANDBY
+}
+
+enum InvoiceSource {
+  EMAIL
+  WHATSAPP
+}
+
+enum BillStatus {
+  DRAFT
+  SUBMITTED
+  AWAITING_PAYMENT
+  PAID
+  VOIDED
+}
+
+enum PaymentBatchStatus {
+  PENDING
+  STANDBY_REQUESTED
+  LOGGING_IN
+  RAISED
+  AWAITING_BANK_APPROVAL
+  APPROVED
+  FAILED
+}
+
+enum TeamMemberRole {
+  SUPERVISOR
+  MEMBER
+}
+
+enum IntegrationType {
+  XERO
+  WHATSAPP
+  EMAIL
+  DBS
+  OCR
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  timezone  String   @default("Asia/Singapore")
+  isActive  Boolean  @default(true) @map("is_active")
+  settings  Json     @default("{}")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  teamMembers   TeamMember[]
+  suppliers     Supplier[]
+  workflowRuns  WorkflowRun[]
+  auditLogs     AuditLogEntry[]
+  integrations  OrganizationIntegration[]
+  xeroTokens    XeroToken[]
+
+  @@map("organizations")
+}
+
+model OrganizationIntegration {
+  id             String          @id @default(cuid())
+  organizationId String          @map("organization_id")
+  type           IntegrationType
+  config         Json            @default("{}")
+  isActive       Boolean         @default(true) @map("is_active")
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, type])
+  @@map("organization_integrations")
+}
+
+model TeamMember {
+  id             String         @id @default(cuid())
+  organizationId String         @map("organization_id")
+  name           String
+  phoneNumber    String         @map("phone_number")
+  role           TeamMemberRole @default(MEMBER)
+  isActive       Boolean        @default(true) @map("is_active")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, phoneNumber])
+  @@map("team_members")
+}
+
+model Supplier {
+  id              String   @id @default(cuid())
+  organizationId  String   @map("organization_id")
+  name            String
+  emailDomain     String?  @map("email_domain")
+  xeroContactId   String?  @map("xero_contact_id")
+  whatsappGroupId String?  @map("whatsapp_group_id")
+  dbsPayeeName    String?  @map("dbs_payee_name")
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  organization      Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  skuMappings       SupplierSkuMapping[]
+  purchaseOrders    PurchaseOrder[]
+  invoiceCandidates InvoiceCandidate[]
+  xeroBills         XeroBill[]
+  reconciliations   ReconciliationRun[]
+  paymentBatches    PaymentBatch[]
+
+  @@unique([organizationId, whatsappGroupId])
+  @@map("suppliers")
+}
+
+model SupplierSkuMapping {
+  id               String   @id @default(cuid())
+  supplierId       String   @map("supplier_id")
+  supplierItemName String   @map("supplier_item_name")
+  xeroItemId       String   @map("xero_item_id")
+  xeroItemCode     String?  @map("xero_item_code")
+  confirmedBy      String?  @map("confirmed_by")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  supplier Supplier @relation(fields: [supplierId], references: [id])
+
+  @@unique([supplierId, supplierItemName])
+  @@map("supplier_sku_mappings")
+}
+
+model WorkflowRun {
+  id             String         @id @default(cuid())
+  organizationId String         @map("organization_id")
+  type           WorkflowType
+  status         WorkflowStatus @default(PENDING)
+  triggerRef     String?        @map("trigger_ref")
+  currentStep    String?        @map("current_step")
+  payload        Json           @default("{}")
+  result         Json?
+  error          String?
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+  completedAt    DateTime?      @map("completed_at")
+
+  organization     Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  approvalRequests ApprovalRequest[]
+  followUpTasks    FollowUpTask[]
+  auditLogs        AuditLogEntry[]
+
+  @@index([organizationId, type, status])
+  @@map("workflow_runs")
+}
+
+model ApprovalRequest {
+  id             String           @id @default(cuid())
+  workflowRunId  String           @map("workflow_run_id")
+  gateType       ApprovalGateType @map("gate_type")
+  status         ApprovalStatus   @default(PENDING)
+  question       String
+  options        Json             @default("[]")
+  response       String?
+  respondedBy    String?          @map("responded_by")
+  expiresAt      DateTime?        @map("expires_at")
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt @map("updated_at")
+  resolvedAt     DateTime?        @map("resolved_at")
+
+  workflowRun WorkflowRun @relation(fields: [workflowRunId], references: [id])
+
+  @@index([status, gateType])
+  @@map("approval_requests")
+}
+
+model FollowUpTask {
+  id            String    @id @default(cuid())
+  workflowRunId String    @map("workflow_run_id")
+  type          String
+  targetPhone   String    @map("target_phone")
+  message       String
+  intervalMin   Int       @default(30) @map("interval_min")
+  nextAt        DateTime  @map("next_at")
+  attempts      Int       @default(0)
+  maxAttempts   Int?      @map("max_attempts")
+  isActive      Boolean   @default(true) @map("is_active")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  workflowRun WorkflowRun @relation(fields: [workflowRunId], references: [id])
+
+  @@index([isActive, nextAt])
+  @@map("follow_up_tasks")
+}
+
+model PurchaseOrder {
+  id           String   @id @default(cuid())
+  supplierId   String   @map("supplier_id")
+  xeroPoId     String?  @map("xero_po_id")
+  xeroPoNumber String?  @map("xero_po_number")
+  waThreadId   String?  @map("wa_thread_id")
+  status       String   @default("DRAFT")
+  totalAmount  Decimal? @map("total_amount") @db.Decimal(12, 2)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  supplier Supplier            @relation(fields: [supplierId], references: [id])
+  lines    PurchaseOrderLine[]
+  bills    XeroBill[]
+
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderLine {
+  id              String   @id @default(cuid())
+  purchaseOrderId String   @map("purchase_order_id")
+  xeroItemId      String?  @map("xero_item_id")
+  itemName        String   @map("item_name")
+  quantity        Decimal  @db.Decimal(12, 3)
+  unit            String?
+  unitPrice       Decimal? @map("unit_price") @db.Decimal(12, 2)
+  lineAmount      Decimal? @map("line_amount") @db.Decimal(12, 2)
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  @@map("purchase_order_lines")
+}
+
+model InvoiceCandidate {
+  id            String        @id @default(cuid())
+  supplierId    String?       @map("supplier_id")
+  source        InvoiceSource
+  sourceRef     String?       @map("source_ref")
+  filePath      String        @map("file_path")
+  extraction    Json?
+  confidence    Json?
+  invoiceNumber String?       @map("invoice_number")
+  invoiceDate   DateTime?     @map("invoice_date")
+  totalAmount   Decimal?      @map("total_amount") @db.Decimal(12, 2)
+  isDuplicate   Boolean       @default(false) @map("is_duplicate")
+  isProcessed   Boolean       @default(false) @map("is_processed")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  supplier Supplier? @relation(fields: [supplierId], references: [id])
+
+  @@index([invoiceNumber, supplierId])
+  @@map("invoice_candidates")
+}
+
+model XeroBill {
+  id              String     @id @default(cuid())
+  supplierId      String     @map("supplier_id")
+  purchaseOrderId String?    @map("purchase_order_id")
+  xeroBillId      String?    @map("xero_bill_id")
+  invoiceNumber   String?    @map("invoice_number")
+  invoiceDate     DateTime?  @map("invoice_date")
+  totalAmount     Decimal?   @map("total_amount") @db.Decimal(12, 2)
+  status          BillStatus @default(DRAFT)
+  dbsReference    String?    @map("dbs_reference")
+  notes           String?
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+  paidAt          DateTime?  @map("paid_at")
+
+  supplier      Supplier       @relation(fields: [supplierId], references: [id])
+  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
+
+  @@map("xero_bills")
+}
+
+model ReconciliationRun {
+  id            String   @id @default(cuid())
+  supplierId    String   @map("supplier_id")
+  periodStart   DateTime @map("period_start")
+  periodEnd     DateTime @map("period_end")
+  soaFilePath   String?  @map("soa_file_path")
+  soaExtraction Json?
+  payableList   Json?    @map("payable_list")
+  summary       Json?
+  status        String   @default("IN_PROGRESS")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  supplier       Supplier       @relation(fields: [supplierId], references: [id])
+  paymentBatches PaymentBatch[]
+
+  @@map("reconciliation_runs")
+}
+
+model PaymentBatch {
+  id                  String             @id @default(cuid())
+  supplierId          String             @map("supplier_id")
+  reconciliationRunId String?            @map("reconciliation_run_id")
+  totalAmount         Decimal            @map("total_amount") @db.Decimal(12, 2)
+  referenceText       String             @map("reference_text")
+  xeroBillIds         Json               @map("xero_bill_ids")
+  dbsTransactionRef   String?            @map("dbs_transaction_ref")
+  status              PaymentBatchStatus @default(PENDING)
+  error               String?
+  createdAt           DateTime           @default(now()) @map("created_at")
+  updatedAt           DateTime           @updatedAt @map("updated_at")
+  raisedAt            DateTime?          @map("raised_at")
+  approvedAt          DateTime?          @map("approved_at")
+
+  supplier          Supplier           @relation(fields: [supplierId], references: [id])
+  reconciliationRun ReconciliationRun? @relation(fields: [reconciliationRunId], references: [id])
+
+  @@map("payment_batches")
+}
+
+model AuditLogEntry {
+  id             String   @id @default(cuid())
+  organizationId String   @map("organization_id")
+  workflowRunId  String?  @map("workflow_run_id")
+  timestampUtc   DateTime @default(now()) @map("timestamp_utc")
+  timestampLocal String   @map("timestamp_local")
+  triggerEvent   String   @map("trigger_event")
+  actor          String
+  sourceChannel  String   @map("source_channel")
+  inputs         Json?
+  decisions      Json?
+  outputs        Json?
+  outcome        String
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  workflowRun  WorkflowRun? @relation(fields: [workflowRunId], references: [id])
+
+  @@index([organizationId, timestampUtc])
+  @@index([actor])
+  @@map("audit_log_entries")
+}
+
+model XeroToken {
+  id             String   @id @default(cuid())
+  organizationId String   @map("organization_id")
+  accessToken    String   @map("access_token")
+  refreshToken   String   @map("refresh_token")
+  expiresAt      DateTime @map("expires_at")
+  tenantId       String   @map("tenant_id")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId])
+  @@map("xero_tokens")
+}

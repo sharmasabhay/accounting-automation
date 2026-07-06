@@ -1,0 +1,20 @@
+{
+  "login": {
+    "orgIdInput": "#orgId",
+    "userIdInput": "#userId",
+    "passwordInput": "#password",
+    "submitButton": "button[type='submit']",
+    "landingIndicator": ".dashboard-home"
+  },
+  "payment": {
+    "payTransferMenu": "text=Pay & Transfer",
+    "payLocalPayee": "text=Pay Local Payee",
+    "payeeSelect": "#payee-select",
+    "amountInput": "#amount",
+    "purposeSelect": "text=Business Expenses",
+    "referenceInput": "#reference",
+    "submitButton": "button:has-text('Submit')",
+    "confirmationRef": ".transaction-reference"
+  },
+  "notes": "Update selectors after receiving DBS IDEAL screen recording from owner"
+}

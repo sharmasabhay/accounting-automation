@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Omakase Admin</title>
+  <link rel="stylesheet" href="/admin/css/admin.css" />
+</head>
+<body>
+  <div id="login-overlay" class="overlay hidden">
+    <div class="login-card card">
+      <h1>Omakase Admin</h1>
+      <p class="muted">Enter your platform API token to manage organizations.</p>
+      <label>API Token</label>
+      <input type="password" id="login-token" placeholder="Bearer token from .env API_TOKEN" />
+      <button id="login-btn" class="btn primary">Sign in</button>
+      <p id="login-error" class="error hidden"></p>
+    </div>
+  </div>
+
+  <div id="app" class="hidden">
+    <aside class="sidebar">
+      <div class="brand">Omakase</div>
+      <nav>
+        <a href="#/" class="nav-link" data-route="list">Organizations</a>
+        <a href="#/new" class="nav-link" data-route="new">+ New Organization</a>
+      </nav>
+      <div class="sidebar-footer">
+        <button id="logout-btn" class="btn ghost sm">Sign out</button>
+      </div>
+    </aside>
+
+    <main class="content">
+      <div id="view-list" class="view hidden">
+        <header class="page-header">
+          <h1>Organizations</h1>
+          <a href="#/new" class="btn primary">Onboard organization</a>
+        </header>
+        <div id="org-list" class="card-grid"></div>
+      </div>
+
+      <div id="view-new" class="view hidden">
+        <header class="page-header"><h1>Onboard organization</h1></header>
+        <form id="create-org-form" class="card form-card">
+          <div class="form-row">
+            <label>Company name *</label>
+            <input name="name" required placeholder="Acme Foods Pte Ltd" />
+          </div>
+          <div class="form-row">
+            <label>Slug * <span class="hint">URL-safe identifier</span></label>
+            <input name="slug" required placeholder="acme-foods" pattern="[a-z0-9-]+" />
+          </div>
+          <div class="form-row">
+            <label>Timezone</label>
+            <input name="timezone" value="Asia/Singapore" />
+          </div>
+          <hr />
+          <h3>Supervisor (optional)</h3>
+          <div class="form-row two-col">
+            <div>
+              <label>Name</label>
+              <input name="supervisorName" placeholder="Jane Tan" />
+            </div>
+            <div>
+              <label>Phone (E.164)</label>
+              <input name="supervisorPhone" placeholder="+6591234567" />
+            </div>
+          </div>
+          <button type="submit" class="btn primary">Create organization</button>
+        </form>
+      </div>
+
+      <div id="view-org" class="view hidden">
+        <header class="page-header">
+          <div>
+            <a href="#/" class="back-link">← Organizations</a>
+            <h1 id="org-title">Organization</h1>
+            <p id="org-subtitle" class="muted"></p>
+          </div>
+        </header>
+
+        <div class="tabs">
+          <button class="tab active" data-tab="overview">Overview</button>
+          <button class="tab" data-tab="team">Team</button>
+          <button class="tab" data-tab="suppliers">Suppliers</button>
+          <button class="tab" data-tab="integrations">Integrations</button>
+          <button class="tab" data-tab="activity">Activity</button>
+        </div>
+
+        <div id="tab-overview" class="tab-panel">
+          <form id="edit-org-form" class="card form-card">
+            <div class="form-row two-col">
+              <div>
+                <label>Company name</label>
+                <input name="name" id="edit-name" />
+              </div>
+              <div>
+                <label>Timezone</label>
+                <input name="timezone" id="edit-timezone" />
+              </div>
+            </div>
+            <div class="form-row">
+              <label class="checkbox-label">
+                <input type="checkbox" name="isActive" id="edit-active" /> Active
+              </label>
+            </div>
+            <button type="submit" class="btn primary">Save changes</button>
+          </form>
+        </div>
+
+        <div id="tab-team" class="tab-panel hidden">
+          <form id="add-member-form" class="card form-card">
+            <h3>Add team member</h3>
+            <div class="form-row three-col">
+              <div><label>Name</label><input name="name" required /></div>
+              <div><label>Phone</label><input name="phoneNumber" required placeholder="+659..." /></div>
+              <div>
+                <label>Role</label>
+                <select name="role">
+                  <option value="MEMBER">Member</option>
+                  <option value="SUPERVISOR">Supervisor</option>
+                </select>
+              </div>
+            </div>
+            <button type="submit" class="btn primary">Add member</button>
+          </form>
+          <div id="team-list" class="table-wrap card"></div>
+        </div>
+
+        <div id="tab-suppliers" class="tab-panel hidden">
+          <form id="add-supplier-form" class="card form-card">
+            <h3>Add supplier</h3>
+            <div class="form-row two-col">
+              <div><label>Name *</label><input name="name" required /></div>
+              <div><label>Email domain</label><input name="emailDomain" placeholder="supplier.com.sg" /></div>
+            </div>
+            <div class="form-row two-col">
+              <div><label>WhatsApp group ID</label><input name="whatsappGroupId" /></div>
+              <div><label>DBS payee name</label><input name="dbsPayeeName" /></div>
+            </div>
+            <div class="form-row">
+              <label>Xero contact ID</label>
+              <input name="xeroContactId" />
+            </div>
+            <button type="submit" class="btn primary">Add supplier</button>
+          </form>
+          <form id="edit-supplier-form" class="card form-card hidden">
+            <h3>Edit supplier</h3>
+            <input type="hidden" name="id" id="edit-supplier-id" />
+            <div class="form-row two-col">
+              <div><label>Name *</label><input name="name" required /></div>
+              <div><label>Email domain</label><input name="emailDomain" placeholder="supplier.com.sg" /></div>
+            </div>
+            <div class="form-row two-col">
+              <div><label>WhatsApp group ID</label><input name="whatsappGroupId" /></div>
+              <div><label>DBS payee name</label><input name="dbsPayeeName" /></div>
+            </div>
+            <div class="form-row">
+              <label>Xero contact ID</label>
+              <input name="xeroContactId" />
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn primary">Save changes</button>
+              <button type="button" id="cancel-edit-supplier-btn" class="btn">Cancel</button>
+            </div>
+          </form>
+          <div id="supplier-list" class="table-wrap card"></div>
+          <div class="card form-card" style="margin-top:1rem">
+            <h3>Xero supplier contacts</h3>
+            <p class="muted" style="margin-bottom:.75rem">
+              Load contacts from your connected Xero org. Copy the Contact ID into the add or edit supplier form,
+              or make sure the supplier name matches exactly.
+            </p>
+            <button type="button" id="load-xero-contacts-btn" class="btn primary">Load contacts from Xero</button>
+            <div id="xero-contacts-list" class="table-wrap" style="margin-top:1rem"></div>
+          </div>
+        </div>
+
+        <div id="tab-integrations" class="tab-panel hidden">
+          <p class="info-banner">
+            Each organization stores its own Xero, WhatsApp, Email IMAP, and DBS credentials.
+            Secrets are encrypted at rest in a future release; currently stored in the database config JSON.
+          </p>
+          <div id="integration-panels"></div>
+        </div>
+
+        <div id="tab-activity" class="tab-panel hidden">
+          <div class="card form-card">
+            <h3>Test PO intake</h3>
+            <p class="muted" style="margin-bottom:.75rem">
+              Queue a PO message directly (skips the webhook). Uses the org supervisor phone by default.
+            </p>
+            <form id="test-po-form" class="form-row">
+              <input name="message" placeholder="- Bok choy: 10 kg" style="flex:1" />
+              <button type="submit" class="btn">Queue directly</button>
+            </form>
+          </div>
+          <div class="card form-card" style="margin-top:1rem">
+            <h3>Test WhatsApp webhook</h3>
+            <p class="muted" style="margin-bottom:.75rem">
+              Simulates a Meta webhook POST to <code>/webhooks/whatsapp</code> using the supervisor phone
+              and configured WhatsApp <code>phone_number_id</code>.
+            </p>
+            <form id="test-whatsapp-webhook-form" class="form-row">
+              <input name="message" placeholder="- Bok choy: 10 kg" style="flex:1" />
+              <button type="submit" class="btn primary">Test webhook</button>
+            </form>
+          </div>
+          <div id="workflow-list" class="table-wrap card"></div>
+        </div>
+      </div>
+
+      <div id="toast" class="toast hidden"></div>
+    </main>
+  </div>
+
+  <script src="/admin/js/api.js"></script>
+  <script src="/admin/js/app.js"></script>
+</body>
+</html>

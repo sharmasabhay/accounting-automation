@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.local
+storage/invoices/*
+storage/audit-logs/*
+!storage/invoices/.gitkeep
+!storage/audit-logs/.gitkeep
+playwright/.auth/
+*.log
+.DS_Store
