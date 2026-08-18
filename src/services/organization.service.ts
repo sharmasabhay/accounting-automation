@@ -209,13 +209,28 @@ class OrganizationService {
 
   /**
    * Resolve which organization owns an inbound WhatsApp message.
-   * Priority: explicit orgId → team member phone → supplier group → WhatsApp phone_number_id.
+   * Priority: explicit orgId → tenant WhatsApp integration (phone_number_id / WABA id)
+   * → team member phone → supplier group.
+   *
+   * The integration lookup comes first because with partner (Embedded Signup)
+   * onboarding, every tenant has its own WABA/phone number — the receiving
+   * number is authoritative for which tenant owns the message.
    */
   async resolveFromWhatsApp(
     message: WhatsAppInboundMessage
   ): Promise<Organization | null> {
     if (message.organizationId) {
       return this.getByIdOrSlug(message.organizationId);
+    }
+
+    if (message.whatsappPhoneNumberId || message.whatsappBusinessAccountId) {
+      const byIntegration = await this.resolveByWhatsAppIntegration(
+        message.whatsappPhoneNumberId,
+        message.whatsappBusinessAccountId
+      );
+      if (byIntegration) {
+        return byIntegration;
+      }
     }
 
     const phone = normalizePhone(message.from);
@@ -238,24 +253,37 @@ class OrganizationService {
       }
     }
 
-    if (message.whatsappPhoneNumberId) {
-      const integrations = await prisma.organizationIntegration.findMany({
-        where: { type: IntegrationType.WHATSAPP, isActive: true },
-        include: { organization: true },
-      });
+    return null;
+  }
 
-      for (const integration of integrations) {
-        const config = integration.config as { phoneNumberId?: string };
-        if (
-          config.phoneNumberId === message.whatsappPhoneNumberId &&
-          integration.organization.isActive
-        ) {
-          return integration.organization;
-        }
+  private async resolveByWhatsAppIntegration(
+    phoneNumberId?: string,
+    businessAccountId?: string
+  ): Promise<Organization | null> {
+    const integrations = await prisma.organizationIntegration.findMany({
+      where: { type: IntegrationType.WHATSAPP, isActive: true },
+      include: { organization: true },
+    });
+
+    let wabaMatch: Organization | null = null;
+
+    for (const integration of integrations) {
+      if (!integration.organization.isActive) continue;
+
+      const config = integration.config as {
+        phoneNumberId?: string;
+        businessAccountId?: string;
+      };
+
+      if (phoneNumberId && config.phoneNumberId === phoneNumberId) {
+        return integration.organization;
+      }
+      if (businessAccountId && config.businessAccountId === businessAccountId) {
+        wabaMatch = integration.organization;
       }
     }
 
-    return null;
+    return wabaMatch;
   }
 
   async listActiveOrganizations(): Promise<Organization[]> {

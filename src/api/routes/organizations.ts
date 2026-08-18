@@ -412,8 +412,10 @@ export async function registerOrganizationRoutes(app: FastifyInstance): Promise<
       organization.id,
       IntegrationType.WHATSAPP
     );
-    const phoneNumberId = (waIntegration?.config as { phoneNumberId?: string } | undefined)
-      ?.phoneNumberId;
+    const waConfig = (waIntegration?.config ?? {}) as {
+      phoneNumberId?: string;
+      businessAccountId?: string;
+    };
 
     const from = body.from ?? supervisorPhone;
     const message = body.message ?? "- Bok choy: 10 kg\n- Zucchini: 40 kg";
@@ -422,7 +424,8 @@ export async function registerOrganizationRoutes(app: FastifyInstance): Promise<
     const payload = buildTestWebhookPayload({
       message,
       from,
-      phoneNumberId,
+      phoneNumberId: waConfig.phoneNumberId,
+      businessAccountId: waConfig.businessAccountId,
       messageId,
     });
 

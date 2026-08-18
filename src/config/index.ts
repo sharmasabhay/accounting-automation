@@ -29,9 +29,16 @@ const envSchema = z.object({
   WHATSAPP_PHONE_NUMBER_ID: z.string().optional(),
   WHATSAPP_VERIFY_TOKEN: z.string().optional(),
   WHATSAPP_BUSINESS_ACCOUNT_ID: z.string().optional(),
+  // Meta partner app (Tech Provider) for WhatsApp Embedded Signup
+  META_APP_ID: z.string().optional(),
+  META_APP_SECRET: z.string().optional(),
+  META_CONFIG_ID: z.string().optional(),
+  META_GRAPH_VERSION: z.string().default("v21.0"),
+  // Public URL of this server (tunnel/domain) used in tenant onboarding links
+  PUBLIC_BASE_URL: z.string().optional(),
   ANTHROPIC_API_KEY: z.string().optional(),
   ANTHROPIC_MODEL: z.string().default("claude-sonnet-4-20250514"),
-  OCR_PROVIDER: z.enum(["mock", "google", "aws"]).default("mock"),
+  OCR_PROVIDER: z.enum(["mock", "claude", "google", "aws"]).default("mock"),
   GOOGLE_DOCUMENT_AI_PROJECT_ID: z.string().optional(),
   GOOGLE_DOCUMENT_AI_LOCATION: z.string().optional(),
   GOOGLE_DOCUMENT_AI_PROCESSOR_ID: z.string().optional(),

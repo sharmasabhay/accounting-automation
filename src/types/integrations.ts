@@ -5,6 +5,10 @@ export interface WhatsAppIntegrationConfig {
   phoneNumberId?: string;
   verifyToken?: string;
   businessAccountId?: string;
+  displayPhoneNumber?: string;
+  /** "embedded_signup" when authorized via the tenant onboarding page */
+  onboardedVia?: string;
+  onboardedAt?: string;
 }
 
 export interface EmailIntegrationConfig {
@@ -56,10 +60,11 @@ export const INTEGRATION_FIELDS: Record<
   Array<{ key: string; label: string; type: "text" | "password" | "number" | "boolean" | "select"; options?: string[]; help?: string }>
 > = {
   WHATSAPP: [
-    { key: "apiToken", label: "API Token", type: "password", help: "Meta WhatsApp Business API permanent token" },
-    { key: "phoneNumberId", label: "Phone Number ID", type: "text", help: "From Meta Developer Console → WhatsApp → API Setup" },
-    { key: "verifyToken", label: "Webhook Verify Token", type: "text", help: "Token you set when registering the webhook URL" },
-    { key: "businessAccountId", label: "Business Account ID", type: "text", help: "Optional — WhatsApp Business Account ID" },
+    { key: "apiToken", label: "API Token", type: "password", help: "Filled automatically by Embedded Signup, or paste a Meta permanent token" },
+    { key: "phoneNumberId", label: "Phone Number ID", type: "text", help: "Filled by Embedded Signup, or from Meta → WhatsApp → API Setup" },
+    { key: "verifyToken", label: "Webhook Verify Token", type: "text", help: "Usually the global WHATSAPP_VERIFY_TOKEN — only needed for manual setups" },
+    { key: "businessAccountId", label: "Business Account ID (WABA)", type: "text", help: "Filled by Embedded Signup — used to route webhooks to this tenant" },
+    { key: "displayPhoneNumber", label: "Display phone number", type: "text", help: "Human-readable number shown after onboarding (read-only)" },
   ],
   EMAIL: [
     { key: "imapHost", label: "IMAP Host", type: "text", help: "e.g. imap.gmail.com" },

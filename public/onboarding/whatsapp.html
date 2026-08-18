@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Connect WhatsApp Business — Omakase</title>
+  <style>
+    :root {
+      --green: #25d366;
+      --green-dark: #128c7e;
+      --ink: #111827;
+      --muted: #6b7280;
+      --border: #e5e7eb;
+      --bg: #f6f8fa;
+      --error: #dc2626;
+      --ok: #16a34a;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 10px 40px rgba(17, 24, 39, 0.08);
+      max-width: 560px;
+      width: 100%;
+      padding: 2.5rem;
+    }
+    .brand { font-weight: 700; letter-spacing: 0.02em; color: var(--green-dark); margin-bottom: 1.5rem; }
+    .wa-badge {
+      width: 56px; height: 56px; border-radius: 14px;
+      background: var(--green); color: #fff;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 30px; margin-bottom: 1.25rem;
+    }
+    h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
+    .org-name { color: var(--green-dark); }
+    p.lead { color: var(--muted); line-height: 1.55; margin-bottom: 1.5rem; }
+    ul.steps { list-style: none; margin-bottom: 1.75rem; }
+    ul.steps li {
+      padding: 0.55rem 0 0.55rem 2rem;
+      position: relative;
+      color: #374151;
+      line-height: 1.4;
+      border-bottom: 1px dashed var(--border);
+    }
+    ul.steps li:last-child { border-bottom: none; }
+    ul.steps li::before {
+      content: "✓";
+      position: absolute; left: 0.25rem;
+      color: var(--green-dark);
+      font-weight: 700;
+    }
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 0.6rem;
+      width: 100%;
+      padding: 0.9rem 1.25rem;
+      font-size: 1rem; font-weight: 600;
+      color: #fff; background: var(--green-dark);
+      border: none; border-radius: 10px; cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    .btn:hover:not(:disabled) { background: #0e6e63; }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .status { margin-top: 1.25rem; padding: 0.9rem 1rem; border-radius: 10px; font-size: 0.95rem; line-height: 1.45; display: none; }
+    .status.error { display: block; background: #fef2f2; color: var(--error); border: 1px solid #fecaca; }
+    .status.info  { display: block; background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+    .status.ok    { display: block; background: #f0fdf4; color: var(--ok); border: 1px solid #bbf7d0; }
+    .done { text-align: center; padding: 1rem 0; display: none; }
+    .done .check { font-size: 56px; color: var(--ok); }
+    .done h2 { margin: 0.75rem 0 0.5rem; }
+    .done p { color: var(--muted); line-height: 1.5; }
+    .done code { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.1rem 0.4rem; }
+    .fineprint { margin-top: 1.5rem; font-size: 0.8rem; color: var(--muted); line-height: 1.5; }
+    .spinner {
+      width: 18px; height: 18px; border-radius: 50%;
+      border: 2.5px solid rgba(255,255,255,0.4); border-top-color: #fff;
+      animation: spin 0.8s linear infinite; display: none;
+    }
+    .btn.loading .spinner { display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">Omakase Accounting</div>
+
+    <div id="main-view">
+      <div class="wa-badge">&#x1F4AC;</div>
+      <h1>Connect your WhatsApp Business account<span id="org-suffix"></span></h1>
+      <p class="lead">
+        Authorize Omakase as a partner on your WhatsApp Business account. This lets us
+        receive your purchase orders and invoices over WhatsApp and send you order
+        confirmations and payment updates — all from your own business number.
+      </p>
+
+      <ul class="steps">
+        <li>Log in with the Facebook account that manages your business</li>
+        <li>Select (or create) your WhatsApp Business account and phone number</li>
+        <li>Grant Omakase access to manage messaging on your behalf</li>
+      </ul>
+
+      <button id="connect-btn" class="btn" disabled>
+        <span class="spinner"></span>
+        <span id="connect-label">Loading…</span>
+      </button>
+
+      <div id="status" class="status"></div>
+
+      <p class="fineprint">
+        You are granting access only to your WhatsApp Business messaging — never your
+        personal account. You can revoke access anytime from Meta Business Settings →
+        Partners.
+      </p>
+    </div>
+
+    <div id="done-view" class="done">
+      <div class="check">&#x2713;</div>
+      <h2>WhatsApp connected</h2>
+      <p id="done-detail">
+        Your WhatsApp Business account is now linked to Omakase. You can close this page —
+        we'll take it from here.
+      </p>
+    </div>
+  </div>
+
+  <script>
+    const token = window.location.pathname.split("/").filter(Boolean).pop();
+    const btn = document.getElementById("connect-btn");
+    const label = document.getElementById("connect-label");
+    const statusEl = document.getElementById("status");
+
+    let signupSettings = null;
+    // Captured from the Embedded Signup postMessage before the popup closes
+    let signupSession = { wabaId: null, phoneNumberId: null };
+
+    function setStatus(kind, msg) {
+      statusEl.className = "status " + kind;
+      statusEl.textContent = msg;
+    }
+    function clearStatus() {
+      statusEl.className = "status";
+      statusEl.textContent = "";
+    }
+    function showDone(detail) {
+      document.getElementById("main-view").style.display = "none";
+      const done = document.getElementById("done-view");
+      if (detail) document.getElementById("done-detail").textContent = detail;
+      done.style.display = "block";
+    }
+
+    async function loadSession() {
+      const res = await fetch(`/onboarding/whatsapp/${token}/session`);
+      if (!res.ok) {
+        setStatus("error", "This onboarding link is invalid or has expired. Please request a new one.");
+        label.textContent = "Link expired";
+        return;
+      }
+      const data = await res.json();
+
+      document.getElementById("org-suffix").textContent = data.organizationName
+        ? ` — ${data.organizationName}`
+        : "";
+
+      if (data.completed) {
+        showDone();
+        return;
+      }
+
+      if (!data.partnerConfigured || !data.signup.appId || !data.signup.configId) {
+        setStatus("error", "Onboarding is not fully configured yet. Please contact your account manager.");
+        label.textContent = "Unavailable";
+        return;
+      }
+
+      signupSettings = data.signup;
+      initFacebookSdk();
+    }
+
+    function initFacebookSdk() {
+      window.fbAsyncInit = function () {
+        FB.init({
+          appId: signupSettings.appId,
+          autoLogAppEvents: true,
+          xfbml: true,
+          version: signupSettings.graphVersion,
+        });
+        btn.disabled = false;
+        label.textContent = "Continue with Facebook";
+      };
+
+      const js = document.createElement("script");
+      js.src = "https://connect.facebook.net/en_US/sdk.js";
+      js.async = true;
+      js.defer = true;
+      js.crossOrigin = "anonymous";
+      js.onerror = () => {
+        setStatus("error", "Could not load the Facebook SDK. Disable ad blockers and reload the page.");
+        label.textContent = "Unavailable";
+      };
+      document.body.appendChild(js);
+    }
+
+    // Embedded Signup reports the selected WABA + phone number via postMessage
+    window.addEventListener("message", (event) => {
+      if (!event.origin.endsWith("facebook.com")) return;
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "WA_EMBEDDED_SIGNUP" && data.event === "FINISH") {
+          signupSession.wabaId = data.data && data.data.waba_id;
+          signupSession.phoneNumberId = data.data && data.data.phone_number_id;
+        }
+      } catch (_) {
+        /* non-JSON messages from FB SDK are expected */
+      }
+    });
+
+    btn.addEventListener("click", () => {
+      clearStatus();
+      btn.disabled = true;
+      btn.classList.add("loading");
+      label.textContent = "Waiting for Facebook…";
+
+      FB.login(
+        (response) => {
+          if (response.authResponse && response.authResponse.code) {
+            completeSignup(response.authResponse.code);
+          } else {
+            btn.disabled = false;
+            btn.classList.remove("loading");
+            label.textContent = "Continue with Facebook";
+            setStatus("info", "Signup was cancelled. Click the button to try again.");
+          }
+        },
+        {
+          config_id: signupSettings.configId,
+          response_type: "code",
+          override_default_response_type: true,
+          extras: { sessionInfoVersion: "3" },
+        }
+      );
+    });
+
+    async function completeSignup(code) {
+      label.textContent = "Finishing setup…";
+      setStatus("info", "Linking your WhatsApp Business account. This can take a few seconds…");
+
+      try {
+        const res = await fetch(`/onboarding/whatsapp/${token}/complete`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            code,
+            wabaId: signupSession.wabaId,
+            phoneNumberId: signupSession.phoneNumberId,
+          }),
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.error || "Onboarding failed");
+        }
+
+        showDone(
+          data.displayPhoneNumber
+            ? `Your WhatsApp number ${data.displayPhoneNumber} is now linked to Omakase. You can close this page.`
+            : undefined
+        );
+      } catch (err) {
+        btn.disabled = false;
+        btn.classList.remove("loading");
+        label.textContent = "Continue with Facebook";
+        setStatus("error", err.message);
+      }
+    }
+
+    loadSession();
+  </script>
+</body>
+</html>

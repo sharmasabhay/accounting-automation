@@ -83,6 +83,13 @@ enum IntegrationType {
   OCR
 }
 
+enum OnboardingSessionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  EXPIRED
+}
+
 model Organization {
   id        String   @id @default(cuid())
   name      String
@@ -99,8 +106,30 @@ model Organization {
   auditLogs     AuditLogEntry[]
   integrations  OrganizationIntegration[]
   xeroTokens    XeroToken[]
+  whatsappOnboardingSessions WhatsAppOnboardingSession[]
 
   @@map("organizations")
+}
+
+/// One-time tokenized session for a tenant to authorize our Meta app
+/// on their WhatsApp Business Account via Embedded Signup.
+model WhatsAppOnboardingSession {
+  id             String                  @id @default(cuid())
+  organizationId String                  @map("organization_id")
+  token          String                  @unique
+  status         OnboardingSessionStatus @default(PENDING)
+  wabaId         String?                 @map("waba_id")
+  phoneNumberId  String?                 @map("phone_number_id")
+  error          String?
+  expiresAt      DateTime                @map("expires_at")
+  completedAt    DateTime?               @map("completed_at")
+  createdAt      DateTime                @default(now()) @map("created_at")
+  updatedAt      DateTime                @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+  @@map("whatsapp_onboarding_sessions")
 }
 
 model OrganizationIntegration {

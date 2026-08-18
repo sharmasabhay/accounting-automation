@@ -24,6 +24,12 @@ export interface ParsedOrderItem {
   unit?: string;
 }
 
+export interface ParsePurchaseOrderResult {
+  isPurchaseOrder: boolean;
+  items: ParsedOrderItem[];
+  reason?: string;
+}
+
 export interface PayableListItem {
   invoiceNumber: string;
   amount: number;
@@ -53,6 +59,8 @@ export interface WhatsAppInboundMessage {
   mentionsBot?: boolean;
   organizationId?: string;
   whatsappPhoneNumberId?: string;
+  /** WABA id from webhook entry.id — identifies the tenant's WhatsApp Business Account */
+  whatsappBusinessAccountId?: string;
 }
 
 export type WorkflowEvent =

@@ -103,6 +103,16 @@ const api = {
     return this.request(`/api/organizations/${slug}/integrations/xero/connect`);
   },
 
+  getWhatsAppOnboarding(slug) {
+    return this.request(`/api/organizations/${slug}/whatsapp/onboarding`);
+  },
+
+  generateWhatsAppOnboardingLink(slug) {
+    return this.request(`/api/organizations/${slug}/whatsapp/onboarding-link`, {
+      method: "POST",
+    });
+  },
+
   listXeroContacts(slug) {
     return this.request(`/api/organizations/${slug}/xero/contacts`);
   },

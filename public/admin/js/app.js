@@ -224,6 +224,7 @@ async function renderIntegrations() {
   }
 
   const data = await api.getIntegrations(currentOrg.slug);
+  const waOnboarding = await api.getWhatsAppOnboarding(currentOrg.slug).catch(() => null);
   const configByType = {};
   data.integrations.forEach((i) => {
     configByType[i.type] = i.config;
@@ -298,9 +299,13 @@ async function renderIntegrations() {
             ${data.xeroStatus?.connected ? `<span class="badge ok">Connected · ${esc(data.xeroStatus.tenantId || "")}</span>` : ""}`
           : "";
 
+      const waOnboardingBox =
+        type === "WHATSAPP" ? renderWhatsAppOnboardingBox(cfg, waOnboarding) : "";
+
       return `<form class="card integration-card" data-integration="${type}">
         <h3>${labels[type]} <span class="badge ${status.cls}">${status.label}</span></h3>
         ${xeroSetup}
+        ${waOnboardingBox}
         ${fieldsHtml}
         <div class="integration-actions">
           <button type="submit" class="btn primary">Save ${labels[type]}</button>
@@ -332,6 +337,31 @@ async function renderIntegrations() {
     };
   });
 
+  container.querySelectorAll(".wa-onboarding-link-btn").forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = "Generating…";
+      try {
+        const result = await api.generateWhatsAppOnboardingLink(currentOrg.slug);
+        await navigator.clipboard.writeText(result.url).catch(() => {});
+        showToast("Onboarding link generated and copied to clipboard");
+        await renderIntegrations();
+      } catch (err) {
+        showToast(err.message);
+        btn.disabled = false;
+        btn.textContent = "Generate onboarding link";
+      }
+    };
+  });
+
+  container.querySelectorAll(".wa-onboarding-url").forEach((el) => {
+    el.style.cursor = "pointer";
+    el.onclick = () => {
+      navigator.clipboard.writeText(el.textContent);
+      showToast("Onboarding link copied — send it to the tenant");
+    };
+  });
+
   container.querySelectorAll(".xero-connect-btn").forEach((btn) => {
     btn.onclick = async () => {
       const xeroForm = container.querySelector('form[data-integration="XERO"]');
@@ -359,6 +389,67 @@ async function renderIntegrations() {
   });
 }
 
+function renderWhatsAppOnboardingBox(cfg, waOnboarding) {
+  const connectedBanner =
+    cfg.onboardedVia === "embedded_signup"
+      ? `<p class="field-help" style="margin-bottom:.5rem">
+          <span class="badge ok">Partner-connected</span>
+          Tenant authorized via Embedded Signup${cfg.displayPhoneNumber ? ` · ${esc(cfg.displayPhoneNumber)}` : ""}${cfg.onboardedAt ? ` · ${new Date(cfg.onboardedAt).toLocaleDateString()}` : ""}
+        </p>`
+      : "";
+
+  if (!waOnboarding) {
+    return `<div class="xero-setup-box">${connectedBanner}
+      <p class="field-help">Could not load onboarding status.</p>
+    </div>`;
+  }
+
+  if (!waOnboarding.partnerConfigured) {
+    return `<div class="xero-setup-box">${connectedBanner}
+      <strong>Tenant onboarding (Embedded Signup)</strong>
+      <p class="field-help">
+        Set <code>META_APP_ID</code>, <code>META_APP_SECRET</code>, and <code>META_CONFIG_ID</code>
+        in <code>.env</code> to enable one-click tenant onboarding. Until then, credentials can be
+        entered manually below.
+      </p>
+    </div>`;
+  }
+
+  const pendingHtml = waOnboarding.pendingLink
+    ? `<p class="field-help">Active link (click to copy, expires ${new Date(waOnboarding.pendingLink.expiresAt).toLocaleString()}):</p>
+       <code class="redirect-uri-box wa-onboarding-url" title="Click to copy">${esc(waOnboarding.pendingLink.url)}</code>`
+    : "";
+
+  const sessionRows = (waOnboarding.sessions || [])
+    .slice(0, 3)
+    .map((s) => {
+      const cls = s.status === "COMPLETED" ? "ok" : s.status === "PENDING" ? "warn" : "off";
+      const detail =
+        s.status === "COMPLETED"
+          ? `WABA ${s.wabaId || "—"}`
+          : s.status === "FAILED"
+            ? esc(s.error || "failed")
+            : `expires ${new Date(s.expiresAt).toLocaleDateString()}`;
+      return `<li style="padding:.2rem 0">
+        <span class="badge ${cls}">${s.status}</span>
+        <span class="field-help" style="display:inline">${detail} · ${new Date(s.createdAt).toLocaleString()}</span>
+      </li>`;
+    })
+    .join("");
+
+  return `<div class="xero-setup-box">${connectedBanner}
+    <strong>Tenant onboarding (Embedded Signup)</strong>
+    <p class="field-help" style="margin:.35rem 0 .6rem">
+      Generate a link and send it to the tenant. They log in with Facebook, pick their
+      WhatsApp Business account, and authorize this app as a partner — credentials below
+      are then filled automatically.
+    </p>
+    <button type="button" class="btn sm primary wa-onboarding-link-btn">Generate onboarding link</button>
+    ${pendingHtml}
+    ${sessionRows ? `<ul style="list-style:none;margin-top:.6rem">${sessionRows}</ul>` : ""}
+  </div>`;
+}
+
 function getIntegrationStatus(type, cfg, xeroStatus) {
   switch (type) {
     case "XERO":
@@ -368,6 +459,9 @@ function getIntegrationStatus(type, cfg, xeroStatus) {
           ? { label: "Configured", cls: "warn" }
           : { label: "Not set", cls: "off" };
     case "WHATSAPP":
+      if (cfg.onboardedVia === "embedded_signup") {
+        return { label: "Connected (partner)", cls: "ok" };
+      }
       return cfg.apiToken && cfg.phoneNumberId
         ? { label: "Configured", cls: "ok" }
         : { label: "Not set", cls: "off" };

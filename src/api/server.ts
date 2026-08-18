@@ -7,9 +7,16 @@ import { logger } from "../utils/logger.js";
 import { registerWhatsAppRoutes } from "./webhooks/whatsapp.js";
 import { registerOrganizationRoutes } from "./routes/organizations.js";
 import { registerXeroAuthRoutes } from "./routes/xero-auth.js";
+import { registerWhatsAppOnboardingRoutes } from "./routes/whatsapp-onboarding.js";
 import { prisma } from "../db/client.js";
 
-const PUBLIC_PATHS = ["/health", "/webhooks/whatsapp", "/auth/xero/callback", "/admin"];
+const PUBLIC_PATHS = [
+  "/health",
+  "/webhooks/whatsapp",
+  "/auth/xero/callback",
+  "/admin",
+  "/onboarding/whatsapp",
+];
 const ADMIN_ROOT = path.join(config.projectRoot, "public/admin");
 
 const MIME_TYPES: Record<string, string> = {
@@ -110,6 +117,7 @@ export async function createServer() {
   await registerOrganizationRoutes(app);
   await registerXeroAuthRoutes(app);
   await registerWhatsAppRoutes(app);
+  await registerWhatsAppOnboardingRoutes(app);
 
   return app;
 }

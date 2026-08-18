@@ -169,9 +169,9 @@ curl -X PUT http://127.0.0.1:3000/api/organizations/my-company/integrations/WHAT
 When a message arrives, the system resolves the organization by:
 
 1. Explicit `organizationId` (API test calls)
-2. Sender phone → team member lookup
-3. Group ID → supplier lookup
-4. WhatsApp `phone_number_id` → org integration config
+2. WhatsApp `phone_number_id` or WABA `entry.id` → org integration config
+3. Sender phone → team member lookup
+4. Group ID → supplier lookup
 
 ## Testing Workflows (without WhatsApp)
 
@@ -186,7 +186,7 @@ Each organization stores integration credentials in `OrganizationIntegration` (t
 | Integration | Config keys | How it's used |
 |---|---|---|
 | **Xero** | `clientId`, `clientSecret`, `redirectUri`, `tenantId` | Admin → Save → **Connect Xero** (OAuth). Tokens stored in `XeroToken` per org. |
-| **WhatsApp** | `apiToken`, `phoneNumberId`, `verifyToken` | Outbound messages use org token. Inbound webhook resolves org via `phoneNumberId`. |
+| **WhatsApp** | `apiToken`, `phoneNumberId`, `verifyToken`, `businessAccountId` | Outbound messages use org token. Inbound webhook resolves org via `phoneNumberId` / WABA id. Prefer **Generate onboarding link** (Embedded Signup) over pasting tokens. |
 | **Email IMAP** | `imapHost`, `imapPort`, `imapUser`, `imapPassword`, folders | Daily email scan uses org's dedicated invoice inbox. |
 | **DBS** | `idealUrl`, `orgId`, `userId`, `password`, `headless` | Playwright macro uses org's DBS IDEAL credentials for payments. |
 | **OCR** | `provider`, Google/AWS keys | Invoice extraction per org (optional). |
@@ -200,9 +200,49 @@ Each organization stores integration credentials in `OrganizationIntegration` (t
 
 ### WhatsApp setup (per organization)
 
-1. Create a Meta WhatsApp Business app
+**Option A — Embedded Signup (recommended for multi-tenant)**
+
+1. Configure the partner Meta app in `.env` (`META_APP_ID`, `META_APP_SECRET`, `META_CONFIG_ID`, `PUBLIC_BASE_URL`)
+2. Admin UI → Organization → **Integrations** → WhatsApp → **Generate onboarding link**
+3. Send the link to the tenant. They authorize your app on their WhatsApp Business Account
+4. Credentials (`apiToken`, `phoneNumberId`, `businessAccountId`) are saved automatically
+5. Webhooks arrive at the global endpoint and are routed to the tenant by `phone_number_id` / WABA id
+
+**Option B — Manual credentials**
+
+1. Create a Meta WhatsApp Business app (or use the shared partner app)
 2. Admin UI → Integrations → WhatsApp → enter `apiToken` and `phoneNumberId`
 3. Register webhook: `https://<your-tunnel>/webhooks/whatsapp` (global endpoint; org resolved by `phone_number_id`)
+
+### Tenant WhatsApp onboarding (Embedded Signup)
+
+Omakase acts as a **Tech Provider / partner**. Tenants authorize the partner Meta app on *their* WhatsApp Business Account via Facebook Embedded Signup — no need to share API tokens by hand.
+
+1. In [Meta Developer Console](https://developers.facebook.com/) create (or open) your WhatsApp Business app and complete Tech Provider / Embedded Signup setup.
+2. Create a **Facebook Login for Business** configuration and note the **Configuration ID**.
+3. Set in `.env`:
+
+```env
+META_APP_ID=your-app-id
+META_APP_SECRET=your-app-secret
+META_CONFIG_ID=your-embedded-signup-config-id
+PUBLIC_BASE_URL=https://your-public-tunnel.example
+WHATSAPP_VERIFY_TOKEN=change-me-webhook-verify-token
+```
+
+4. Point the Meta app webhook to `https://<PUBLIC_BASE_URL>/webhooks/whatsapp` and subscribe to `messages`.
+5. From Admin → Integrations → WhatsApp, click **Generate onboarding link** and send it to the tenant.
+6. The tenant opens `/onboarding/whatsapp/<token>`, signs in with Facebook, picks their WABA + phone number, and authorizes the app.
+7. The backend exchanges the signup code, subscribes the app to the tenant's WABA, registers the phone number, and stores the tenant's WhatsApp integration.
+
+Webhook verification uses `WHATSAPP_VERIFY_TOKEN`. Incoming POSTs are signature-checked with `META_APP_SECRET` (`X-Hub-Signature-256`) when the secret is set.
+
+Tenant resolution for inbound messages (highest priority first):
+
+1. Explicit `organizationId` (API tests)
+2. `phone_number_id` or WABA `entry.id` → org WhatsApp integration
+3. Sender phone → team member
+4. Group ID → supplier
 
 ### Email IMAP setup (per organization)
 
@@ -233,11 +273,12 @@ pm2 start ecosystem.config.cjs
 
 ## WhatsApp Webhook Setup
 
-1. Create a Meta WhatsApp Business app and obtain API credentials.
+1. Create a Meta WhatsApp Business app (partner / Tech Provider) and obtain API credentials.
 2. Set in `.env`:
-   - `WHATSAPP_API_TOKEN`
-   - `WHATSAPP_PHONE_NUMBER_ID`
-   - `WHATSAPP_VERIFY_TOKEN`
+   - `META_APP_ID` / `META_APP_SECRET` / `META_CONFIG_ID` (Embedded Signup)
+   - `WHATSAPP_VERIFY_TOKEN` (webhook handshake)
+   - `PUBLIC_BASE_URL` (public HTTPS URL of this server)
+   - Optional fallbacks: `WHATSAPP_API_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`
 3. Expose the local server via a tunnel (e.g. Cloudflare Tunnel, ngrok):
 
    ```bash
@@ -246,27 +287,33 @@ pm2 start ecosystem.config.cjs
 
 4. Configure Meta webhook URL: `https://<your-tunnel>/webhooks/whatsapp`
 5. Subscribe to `messages` events.
+6. Onboard each tenant via Admin → Integrations → WhatsApp → **Generate onboarding link**.
 
 ## Project Structure
 
 ```
 src/
-├── api/              # Fastify server, webhooks, admin endpoints
-├── config/           # Environment validation (Zod)
-├── db/               # Prisma client
-├── jobs/             # BullMQ queue, worker, schedulers
-├── orchestrator/     # Event router → workflows
-├── workflows/        # Sub-process 1–4 implementations
-├── services/         # Xero, WhatsApp, OCR, LLM, DBS, audit, auth
-├── prompts/          # LLM system prompts (injection-safe)
-└── types/            # Shared TypeScript interfaces
+│   ├── routes/           # Org admin + Xero/WhatsApp onboarding OAuth
+│   └── webhooks/         # WhatsApp Cloud API webhook
+├── config/               # Environment validation (Zod)
+├── db/                   # Prisma client
+├── jobs/                 # BullMQ queue, worker, schedulers
+├── orchestrator/         # Event router → workflows
+├── workflows/            # Sub-process 1–4 implementations
+├── services/             # Xero, WhatsApp, OCR, LLM, DBS, audit, auth
+├── prompts/              # LLM system prompts (injection-safe)
+└── types/                # Shared TypeScript interfaces
+
+public/
+├── admin/                # Platform admin UI
+└── onboarding/           # Tenant-facing WhatsApp Embedded Signup page
 
 prisma/
-└── schema.prisma     # Database schema
+└── schema.prisma         # Database schema
 
 storage/
-├── invoices/         # Raw invoice attachments
-└── audit-logs/       # Append-only audit files (7-year retention)
+├── invoices/             # Raw invoice attachments
+└── audit-logs/           # Append-only audit files (7-year retention)
 ```
 
 ## Environment Variables Reference
@@ -279,7 +326,11 @@ storage/
 | `DRY_RUN` | No | `true` = simulate Xero/DBS writes (default: `true`) |
 | `ANTHROPIC_API_KEY` | No | Claude API for parsing/extraction (falls back to mock) |
 | `XERO_CLIENT_ID` | No | Xero OAuth (required for live Xero integration) |
-| `WHATSAPP_API_TOKEN` | No | Meta WhatsApp API (logs messages in dry mode) |
+| `WHATSAPP_API_TOKEN` | No | Meta WhatsApp API fallback (prefer per-org Embedded Signup) |
+| `META_APP_ID` | No* | Partner Meta app ID (*required for Embedded Signup) |
+| `META_APP_SECRET` | No* | Partner Meta app secret (also used for webhook signature checks) |
+| `META_CONFIG_ID` | No* | Facebook Login for Business Embedded Signup configuration ID |
+| `PUBLIC_BASE_URL` | No | Public HTTPS base URL used in tenant onboarding links |
 | `EMAIL_IMAP_*` | No | Invoice inbox scanning |
 | `DBS_*` | No | DBS IDEAL Playwright automation |
 
