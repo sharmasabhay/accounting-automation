@@ -1,4 +1,4 @@
-import { WorkflowStatus, ApprovalGateType } from "@prisma/client";
+import { WorkflowStatus, ApprovalGateType, Prisma } from "@prisma/client";
 import { prisma } from "../../db/client.js";
 import { getOrganizationId } from "../../context/tenant.js";
 import { authorizationService } from "../../services/authorization.service.js";
@@ -363,7 +363,7 @@ export const invoiceCaptureWorkflow = {
   async failRun(
     workflowRunId: string,
     error: string,
-    extra?: Record<string, unknown>
+    extra?: Prisma.InputJsonObject
   ): Promise<void> {
     await prisma.workflowRun.update({
       where: { id: workflowRunId },
