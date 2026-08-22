@@ -13,6 +13,8 @@ const UUID_RE =
 export interface XeroPurchaseOrderInput {
   supplierContactId: string;
   contactName?: string;
+  /** When set, used as Xero PurchaseOrderNumber so WhatsApp/system ref matches Xero. */
+  purchaseOrderNumber?: string;
   lineItems: Array<{
     itemCode?: string;
     description: string;
@@ -324,7 +326,7 @@ class XeroService {
     input: XeroPurchaseOrderInput
   ): Promise<{ xeroPoId: string; xeroPoNumber: string }> {
     if (config.DRY_RUN || !(await this.isConfiguredForOrg(organizationId))) {
-      const mockId = `DRY-PO-${Date.now()}`;
+      const mockId = input.purchaseOrderNumber ?? `DRY-PO-${Date.now()}`;
       logger.info({ organizationId, input, mockId }, "[DRY_RUN] Xero PO created");
       return { xeroPoId: mockId, xeroPoNumber: mockId };
     }
@@ -340,6 +342,9 @@ class XeroService {
         PurchaseOrders: [
           {
             Contact: { ContactID: contactId },
+            ...(input.purchaseOrderNumber
+              ? { PurchaseOrderNumber: input.purchaseOrderNumber }
+              : {}),
             LineItems: input.lineItems.map((line) => ({
               Description: line.description,
               Quantity: line.quantity,

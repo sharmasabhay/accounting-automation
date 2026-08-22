@@ -228,6 +228,7 @@ export const poIntakeWorkflow = {
     });
 
     try {
+      // Same ref for WhatsApp/system messages and Xero PurchaseOrderNumber
       const poNumber = `PO-${new Date().getFullYear()}-${String(Date.now()).slice(-4)}`;
       const lineItems = draft.items.map((item) => ({
         description: item.itemName,
@@ -238,14 +239,18 @@ export const poIntakeWorkflow = {
       const xeroPo = await xeroService.createPurchaseOrder(organizationId, {
         supplierContactId: supplier.xeroContactId ?? supplier.id,
         contactName: supplier.name,
+        purchaseOrderNumber: poNumber,
         lineItems,
       });
+
+      // Prefer Xero's returned number so messages always match what is in Xero
+      const displayPoNumber = xeroPo.xeroPoNumber || poNumber;
 
       const po = await prisma.purchaseOrder.create({
         data: {
           supplierId: supplier.id,
           xeroPoId: xeroPo.xeroPoId,
-          xeroPoNumber: xeroPo.xeroPoNumber,
+          xeroPoNumber: displayPoNumber,
           waThreadId: draft.messageId,
           status: "SUBMITTED",
           lines: {
@@ -260,7 +265,7 @@ export const poIntakeWorkflow = {
 
       if (supplier.whatsappGroupId) {
         const orderText = [
-          `PO Ref: ${poNumber}`,
+          `PO Ref: ${displayPoNumber}`,
           "Order:",
           formatItems(draft.items),
           "Please confirm availability.",
@@ -270,7 +275,7 @@ export const poIntakeWorkflow = {
 
       await whatsappService.sendText(
         draft.from,
-        `✅ PO created: ${poNumber}\nSupplier: ${supplier.name}\nItems:\n${formatItems(draft.items)}`
+        `✅ PO created: ${displayPoNumber}\nSupplier: ${supplier.name}\nItems:\n${formatItems(draft.items)}`
       );
 
       await prisma.workflowRun.update({
