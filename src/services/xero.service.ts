@@ -13,7 +13,7 @@ const UUID_RE =
 export interface XeroPurchaseOrderInput {
   supplierContactId: string;
   contactName?: string;
-  /** When set, used as Xero PurchaseOrderNumber so WhatsApp/system ref matches Xero. */
+  /** When set, sent as Xero PurchaseOrderNumber (shown as "Order number" in Xero). */
   purchaseOrderNumber?: string;
   lineItems: Array<{
     itemCode?: string;
@@ -43,10 +43,17 @@ interface XeroTokenRecord {
   tenantId: string;
 }
 
+interface XeroPurchaseOrderRecord {
+  PurchaseOrderID?: string;
+  PurchaseOrderNumber?: string;
+  HasErrors?: boolean;
+  ValidationErrors?: Array<{ Message?: string }>;
+}
+
 interface XeroPurchaseOrderResponse {
-  PurchaseOrders?: Array<{
-    PurchaseOrderID?: string;
-    PurchaseOrderNumber?: string;
+  PurchaseOrders?: XeroPurchaseOrderRecord[];
+  Elements?: Array<{
+    ValidationErrors?: Array<{ Message?: string }>;
   }>;
 }
 
@@ -82,6 +89,7 @@ class XeroService {
       "accounting.attachments",
       "accounting.invoices",
       "accounting.payments",
+      "accounting.transactions",
     ];
 
     const params = new URLSearchParams({
@@ -321,6 +329,42 @@ class XeroService {
     return contact.ContactID;
   }
 
+  private extractPurchaseOrderValidationError(
+    result: XeroPurchaseOrderResponse
+  ): string | undefined {
+    const po = result.PurchaseOrders?.[0];
+    const poErrors = po?.ValidationErrors?.map((error) => error.Message).filter(Boolean);
+    if (poErrors?.length) {
+      return poErrors.join("; ");
+    }
+    if (po?.HasErrors) {
+      return "Xero reported errors on the purchase order";
+    }
+    return result.Elements?.[0]?.ValidationErrors?.map((error) => error.Message).filter(Boolean)
+      .join("; ");
+  }
+
+  async getPurchaseOrderById(
+    organizationId: string,
+    purchaseOrderId: string
+  ): Promise<{ xeroPoId: string; xeroPoNumber: string }> {
+    const result = await this.xeroApiRequest<XeroPurchaseOrderResponse>(
+      organizationId,
+      "GET",
+      `/PurchaseOrders/${purchaseOrderId}`
+    );
+
+    const po = result.PurchaseOrders?.[0];
+    if (!po?.PurchaseOrderID || !po.PurchaseOrderNumber) {
+      throw new Error("Xero purchase order number not found");
+    }
+
+    return {
+      xeroPoId: po.PurchaseOrderID,
+      xeroPoNumber: po.PurchaseOrderNumber,
+    };
+  }
+
   async createPurchaseOrder(
     organizationId: string,
     input: XeroPurchaseOrderInput
@@ -338,49 +382,69 @@ class XeroService {
         input.contactName
       );
 
-      const payload = {
-        PurchaseOrders: [
-          {
-            Contact: { ContactID: contactId },
-            ...(input.purchaseOrderNumber
-              ? { PurchaseOrderNumber: input.purchaseOrderNumber }
-              : {}),
-            LineItems: input.lineItems.map((line) => ({
-              Description: line.description,
-              Quantity: line.quantity,
-              UnitAmount: line.unitAmount,
-              ...(line.itemCode ? { ItemCode: line.itemCode } : {}),
-            })),
-            Status: "AUTHORISED",
-          },
-        ],
+      const today = new Date().toISOString().slice(0, 10);
+      const purchaseOrder: Record<string, unknown> = {
+        Contact: { ContactID: contactId },
+        Date: today,
+        LineItems: input.lineItems.map((line) => ({
+          Description: line.description,
+          Quantity: line.quantity,
+          UnitAmount: line.unitAmount,
+          ...(line.itemCode ? { ItemCode: line.itemCode } : {}),
+        })),
+        Status: "AUTHORISED",
       };
+
+      if (input.purchaseOrderNumber) {
+        purchaseOrder.PurchaseOrderNumber = input.purchaseOrderNumber;
+      }
 
       const result = await this.xeroApiRequest<XeroPurchaseOrderResponse>(
         organizationId,
-        "POST",
+        "PUT",
         "/PurchaseOrders",
-        payload
+        { PurchaseOrders: [purchaseOrder] }
       );
 
-      const po = result.PurchaseOrders?.[0];
-      if (!po?.PurchaseOrderID) {
+      const validationError = this.extractPurchaseOrderValidationError(result);
+      if (validationError) {
+        throw new Error(`Xero purchase order validation failed: ${validationError}`);
+      }
+
+      const created = result.PurchaseOrders?.[0];
+      if (!created?.PurchaseOrderID) {
         throw new Error("Xero did not return a Purchase Order ID");
+      }
+
+      const confirmed = await this.getPurchaseOrderById(
+        organizationId,
+        created.PurchaseOrderID
+      );
+
+      if (
+        input.purchaseOrderNumber &&
+        confirmed.xeroPoNumber !== input.purchaseOrderNumber
+      ) {
+        logger.warn(
+          {
+            organizationId,
+            requestedOrderNumber: input.purchaseOrderNumber,
+            xeroOrderNumber: confirmed.xeroPoNumber,
+          },
+          "Xero assigned a different order number than requested"
+        );
       }
 
       logger.info(
         {
           organizationId,
-          xeroPoId: po.PurchaseOrderID,
-          xeroPoNumber: po.PurchaseOrderNumber,
+          xeroPoId: confirmed.xeroPoId,
+          xeroOrderNumber: confirmed.xeroPoNumber,
         },
         "Xero PO created"
       );
 
-      return {
-        xeroPoId: po.PurchaseOrderID,
-        xeroPoNumber: po.PurchaseOrderNumber ?? po.PurchaseOrderID,
-      };
+      return confirmed;
     });
   }
 

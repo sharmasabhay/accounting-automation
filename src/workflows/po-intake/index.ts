@@ -228,29 +228,28 @@ export const poIntakeWorkflow = {
     });
 
     try {
-      // Same ref for WhatsApp/system messages and Xero PurchaseOrderNumber
-      const poNumber = `PO-${new Date().getFullYear()}-${String(Date.now()).slice(-4)}`;
       const lineItems = draft.items.map((item) => ({
         description: item.itemName,
         quantity: item.quantity,
         unitAmount: 0,
       }));
 
+      // Create in Xero first; PurchaseOrderNumber is shown as "Order number" in Xero UI
+      const suggestedOrderNumber = `PO-${new Date().getFullYear()}-${String(Date.now()).slice(-4)}`;
       const xeroPo = await xeroService.createPurchaseOrder(organizationId, {
         supplierContactId: supplier.xeroContactId ?? supplier.id,
         contactName: supplier.name,
-        purchaseOrderNumber: poNumber,
+        purchaseOrderNumber: suggestedOrderNumber,
         lineItems,
       });
 
-      // Prefer Xero's returned number so messages always match what is in Xero
-      const displayPoNumber = xeroPo.xeroPoNumber || poNumber;
+      const orderNumber = xeroPo.xeroPoNumber;
 
       const po = await prisma.purchaseOrder.create({
         data: {
           supplierId: supplier.id,
           xeroPoId: xeroPo.xeroPoId,
-          xeroPoNumber: displayPoNumber,
+          xeroPoNumber: orderNumber,
           waThreadId: draft.messageId,
           status: "SUBMITTED",
           lines: {
@@ -265,7 +264,7 @@ export const poIntakeWorkflow = {
 
       if (supplier.whatsappGroupId) {
         const orderText = [
-          `PO Ref: ${displayPoNumber}`,
+          `PO Ref: ${orderNumber}`,
           "Order:",
           formatItems(draft.items),
           "Please confirm availability.",
@@ -275,7 +274,7 @@ export const poIntakeWorkflow = {
 
       await whatsappService.sendText(
         draft.from,
-        `✅ PO created: ${displayPoNumber}\nSupplier: ${supplier.name}\nItems:\n${formatItems(draft.items)}`
+        `✅ PO created: ${orderNumber}\nSupplier: ${supplier.name}\nItems:\n${formatItems(draft.items)}`
       );
 
       await prisma.workflowRun.update({
