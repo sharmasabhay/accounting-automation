@@ -88,8 +88,7 @@ class XeroService {
       "accounting.contacts",
       "accounting.attachments",
       "accounting.invoices",
-      "accounting.payments",
-      "accounting.transactions",
+      "accounting.payments"      
     ];
 
     const params = new URLSearchParams({
