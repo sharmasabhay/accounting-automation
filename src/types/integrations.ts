@@ -38,7 +38,7 @@ export interface DbsIntegrationConfig {
 }
 
 export interface OcrIntegrationConfig {
-  provider?: "mock" | "google" | "aws";
+  provider?: "tesseract" | "claude" | "google" | "aws" | "mock";
   googleProjectId?: string;
   googleLocation?: string;
   googleProcessorId?: string;
@@ -69,10 +69,10 @@ export const INTEGRATION_FIELDS: Record<
   EMAIL: [
     { key: "imapHost", label: "IMAP Host", type: "text", help: "e.g. imap.gmail.com" },
     { key: "imapPort", label: "IMAP Port", type: "number", help: "Usually 993 for SSL" },
-    { key: "imapUser", label: "IMAP Username", type: "text", help: "Dedicated invoice inbox email address" },
-    { key: "imapPassword", label: "IMAP Password", type: "password", help: "App password for Gmail/M365" },
-    { key: "inboxFolder", label: "Inbox Folder", type: "text", help: "Default: INBOX" },
-    { key: "processedFolder", label: "Processed Folder", type: "text", help: "Folder to move emails after processing" },
+    { key: "imapUser", label: "IMAP Username", type: "text", help: "Dedicated invoice inbox, e.g. invoices@yourcompany.com" },
+    { key: "imapPassword", label: "IMAP Password", type: "password", help: "Gmail/M365 app password — not the normal login password" },
+    { key: "inboxFolder", label: "Inbox Folder", type: "text", help: "Default: INBOX. Only unread messages are scanned." },
+    { key: "processedFolder", label: "Processed Folder", type: "text", help: "Mail is moved here after invoices are read" },
   ],
   XERO: [
     { key: "clientId", label: "Client ID", type: "text", help: "From Xero Developer Portal app" },
@@ -88,7 +88,7 @@ export const INTEGRATION_FIELDS: Record<
     { key: "headless", label: "Headless Browser", type: "boolean", help: "Run Playwright without visible browser" },
   ],
   OCR: [
-    { key: "provider", label: "Provider", type: "select", options: ["mock", "google", "aws"] },
+    { key: "provider", label: "Provider", type: "select", options: ["tesseract", "claude", "google", "aws"], help: "tesseract = local open-source (Poppler + Tesseract). claude = Anthropic vision fallback." },
     { key: "googleProjectId", label: "Google Project ID", type: "text" },
     { key: "googleLocation", label: "Google Location", type: "text" },
     { key: "googleProcessorId", label: "Google Processor ID", type: "text" },

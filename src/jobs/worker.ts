@@ -1,8 +1,10 @@
 import { createWorkflowWorker, setupSchedulers } from "./queue.js";
 import { logger } from "../utils/logger.js";
 import { disconnectDb } from "../db/client.js";
+import { installProcessErrorAlerts } from "../utils/error-alert.js";
 
 async function main(): Promise<void> {
+  installProcessErrorAlerts();
   logger.info("Starting Omakase workflow worker...");
 
   await setupSchedulers();

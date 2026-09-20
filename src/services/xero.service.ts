@@ -1,9 +1,13 @@
-import { config } from "../config/index.js";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { prisma } from "../db/client.js";
 import { logger } from "../utils/logger.js";
 import { withRetry } from "../utils/storage.js";
+import { isWithinDaysBefore } from "../utils/matching.js";
+import { XeroApiError, notifySupervisorOfXeroError } from "../utils/xero-error.js";
 import { integrationConfigService } from "./integration-config.service.js";
 import type { XeroIntegrationConfig } from "../types/integrations.js";
+import type { XeroBillRecord, XeroItem, XeroOpenPurchaseOrder } from "../types/index.js";
 
 const XERO_API_BASE = "https://api.xero.com/api.xro/2.0";
 const TOKEN_URL = "https://identity.xero.com/connect/token";
@@ -13,7 +17,6 @@ const UUID_RE =
 export interface XeroPurchaseOrderInput {
   supplierContactId: string;
   contactName?: string;
-  /** When set, sent as Xero PurchaseOrderNumber (shown as "Order number" in Xero). */
   purchaseOrderNumber?: string;
   lineItems: Array<{
     itemCode?: string;
@@ -25,15 +28,21 @@ export interface XeroPurchaseOrderInput {
 
 export interface XeroBillInput {
   purchaseOrderId?: string;
+  purchaseOrderNumber?: string;
   supplierContactId: string;
+  contactName?: string;
   invoiceNumber: string;
   invoiceDate: string;
+  dueDate?: string;
   lineItems: Array<{
+    itemCode?: string;
     description: string;
     quantity: number;
     unitAmount: number;
   }>;
   total: number;
+  attachmentPath?: string;
+  attachmentName?: string;
 }
 
 interface XeroTokenRecord {
@@ -46,8 +55,19 @@ interface XeroTokenRecord {
 interface XeroPurchaseOrderRecord {
   PurchaseOrderID?: string;
   PurchaseOrderNumber?: string;
+  Status?: string;
+  Date?: string;
+  DateString?: string;
+  Total?: number;
   HasErrors?: boolean;
   ValidationErrors?: Array<{ Message?: string }>;
+  LineItems?: Array<{
+    Description?: string;
+    ItemCode?: string;
+    Quantity?: number;
+    UnitAmount?: number;
+    LineAmount?: number;
+  }>;
 }
 
 interface XeroPurchaseOrderResponse {
@@ -62,6 +82,28 @@ interface XeroContactsResponse {
     ContactID?: string;
     Name?: string;
     EmailAddress?: string;
+  }>;
+}
+
+interface XeroItemsResponse {
+  Items?: Array<{
+    ItemID?: string;
+    Code?: string;
+    Name?: string;
+  }>;
+}
+
+interface XeroInvoicesResponse {
+  Invoices?: Array<{
+    InvoiceID?: string;
+    InvoiceNumber?: string;
+    Date?: string;
+    DateString?: string;
+    Total?: number;
+    Status?: string;
+    AmountDue?: number;
+    HasErrors?: boolean;
+    ValidationErrors?: Array<{ Message?: string }>;
   }>;
 }
 
@@ -88,7 +130,8 @@ class XeroService {
       "accounting.contacts",
       "accounting.attachments",
       "accounting.invoices",
-      "accounting.payments"      
+      "accounting.payments",
+      "accounting.purchaseorders",
     ];
 
     const params = new URLSearchParams({
@@ -169,14 +212,14 @@ class XeroService {
   async listContacts(
     organizationId: string
   ): Promise<Array<{ contactId: string; name: string; email?: string }>> {
-    if (config.DRY_RUN || !(await this.isConfiguredForOrg(organizationId))) {
+    if (!(await this.isConfiguredForOrg(organizationId))) {
       return [];
     }
 
     const result = await this.xeroApiRequest<XeroContactsResponse>(
       organizationId,
       "GET",
-      '/Contacts?where=IsSupplier==true&order=Name'
+      "/Contacts"
     );
 
     return (result.Contacts ?? [])
@@ -184,7 +227,23 @@ class XeroService {
       .map((c) => ({
         contactId: c.ContactID!,
         name: c.Name!,
-        email: (c as { EmailAddress?: string }).EmailAddress,
+        email: c.EmailAddress,
+      }));
+  }
+
+  async listItems(organizationId: string): Promise<XeroItem[]> {
+    if (!(await this.isConfiguredForOrg(organizationId))) {
+      logger.info({ organizationId }, "Xero not connected — items list skipped");
+      return [];
+    }
+
+    const result = await this.xeroApiRequest<XeroItemsResponse>(organizationId, "GET", "/Items");
+    return (result.Items ?? [])
+      .filter((item) => item.ItemID && item.Name)
+      .map((item) => ({
+        itemId: item.ItemID!,
+        code: item.Code ?? item.ItemID!,
+        name: item.Name!,
       }));
   }
 
@@ -205,7 +264,7 @@ class XeroService {
   private async getValidToken(organizationId: string): Promise<XeroTokenRecord> {
     const stored = await prisma.xeroToken.findUnique({ where: { organizationId } });
     if (!stored) {
-      throw new Error("Xero not connected for this organization — use Admin → Connect Xero");
+      throw new XeroApiError("Xero not connected for this organization — use Admin → Connect Xero");
     }
 
     const expiresSoon = stored.expiresAt.getTime() - Date.now() < 60_000;
@@ -222,7 +281,7 @@ class XeroService {
   ): Promise<XeroTokenRecord> {
     const xero = await this.getOrgConfig(organizationId);
     if (!xero.clientId || !xero.clientSecret) {
-      throw new Error("Xero client credentials missing");
+      throw new XeroApiError("Xero client credentials missing");
     }
 
     const tokenRes = await fetch(TOKEN_URL, {
@@ -239,7 +298,7 @@ class XeroService {
 
     if (!tokenRes.ok) {
       const body = await tokenRes.text();
-      throw new Error(`Xero token refresh failed: ${body}`);
+      throw new XeroApiError(`Xero token refresh failed: ${body}`, { path: "/token" });
     }
 
     const tokens = (await tokenRes.json()) as {
@@ -267,25 +326,106 @@ class XeroService {
     body?: unknown
   ): Promise<T> {
     const token = await this.getValidToken(organizationId);
+    if (!token.tenantId) {
+      throw new XeroApiError("Xero tenant ID is missing — reconnect Xero in Admin → Integrations");
+    }
+
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${token.accessToken}`,
+      "xero-tenant-id": token.tenantId,
+      Accept: "application/json",
+    };
+    if (body !== undefined) {
+      headers["Content-Type"] = "application/json";
+    }
 
     const response = await fetch(`${XERO_API_BASE}${path}`, {
       method,
-      headers: {
-        Authorization: `Bearer ${token.accessToken}`,
-        "xero-tenant-id": token.tenantId,
-        Accept: "application/json",
-        "Content-Type": "application/json",
-      },
-      body: body ? JSON.stringify(body) : undefined,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
     });
 
     const text = await response.text();
     if (!response.ok) {
-      logger.error({ organizationId, path, status: response.status, body: text }, "Xero API error");
-      throw new Error(`Xero API ${response.status}: ${text}`);
+      const apiError = new XeroApiError(this.formatXeroApiError(response.status, path, text), {
+        status: response.status,
+        path,
+      });
+      logger.error(
+        { err: apiError, organizationId, path, status: response.status, body: text },
+        "Xero API error"
+      );
+      throw apiError;
     }
 
     return text ? (JSON.parse(text) as T) : ({} as T);
+  }
+
+  private formatXeroApiError(status: number, path: string, body: string): string {
+    const lower = body.toLowerCase();
+    const insufficientScope =
+      lower.includes("insufficient_scope") ||
+      lower.includes("authenticationunsuccessful") ||
+      ((status === 401 || status === 403) && path.startsWith("/Items"));
+
+    if (insufficientScope && path.startsWith("/Items")) {
+      return "Xero refused to list items (missing accounting.settings scope). Reconnect Xero in Admin → Integrations so the new scope is granted.";
+    }
+    if (insufficientScope) {
+      return `Xero API ${status}: insufficient scope. Reconnect Xero in Admin → Integrations.`;
+    }
+
+    let detail = body.trim();
+    try {
+      const parsed = JSON.parse(body) as {
+        Title?: string;
+        Detail?: string;
+        Message?: string;
+        Elements?: Array<{ ValidationErrors?: Array<{ Message?: string }> }>;
+      };
+      const elementErrors = parsed.Elements?.flatMap((element) => element.ValidationErrors ?? [])
+        .map((error) => error.Message)
+        .filter(Boolean)
+        .join("; ");
+      detail = elementErrors || parsed.Detail || parsed.Message || parsed.Title || detail;
+    } catch {
+      // keep raw body
+    }
+
+    return `Xero API ${status}: ${detail}`.slice(0, 400);
+  }
+
+  private async xeroApiUpload(
+    organizationId: string,
+    invoiceId: string,
+    filename: string,
+    buffer: Buffer,
+    contentType: string
+  ): Promise<void> {
+    const token = await this.getValidToken(organizationId);
+    const encodedName = encodeURIComponent(filename);
+    const response = await fetch(
+      `${XERO_API_BASE}/Invoices/${invoiceId}/Attachments/${encodedName}`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${token.accessToken}`,
+          "xero-tenant-id": token.tenantId,
+          Accept: "application/json",
+          "Content-Type": contentType,
+          "Content-Length": String(buffer.length),
+        },
+        body: buffer,
+      }
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new XeroApiError(`Xero attachment upload failed: ${response.status} ${text}`, {
+        status: response.status,
+        path: `/Invoices/${invoiceId}/Attachments`,
+      });
+    }
   }
 
   private isXeroUuid(value: string): boolean {
@@ -302,7 +442,7 @@ class XeroService {
     }
 
     if (!contactName) {
-      throw new Error(
+      throw new XeroApiError(
         "Supplier has no Xero Contact ID — set xeroContactId in Admin → Suppliers (UUID from Xero)"
       );
     }
@@ -316,7 +456,7 @@ class XeroService {
 
     const contact = result.Contacts?.[0];
     if (!contact?.ContactID) {
-      throw new Error(
+      throw new XeroApiError(
         `No Xero contact found for supplier "${contactName}". Create the supplier in Xero or set xeroContactId.`
       );
     }
@@ -343,36 +483,64 @@ class XeroService {
       .join("; ");
   }
 
+  private mapPurchaseOrder(po: XeroPurchaseOrderRecord): XeroOpenPurchaseOrder | null {
+    if (!po.PurchaseOrderID) return null;
+    return {
+      xeroPoId: po.PurchaseOrderID,
+      xeroPoNumber: po.PurchaseOrderNumber ?? po.PurchaseOrderID,
+      date: (po.DateString ?? po.Date ?? "").slice(0, 10),
+      status: po.Status ?? "AUTHORISED",
+      total: Number(po.Total ?? 0),
+      lineItems: (po.LineItems ?? []).map((line) => ({
+        description: line.Description ?? "",
+        itemCode: line.ItemCode,
+        quantity: Number(line.Quantity ?? 0),
+        unitAmount: Number(line.UnitAmount ?? 0),
+      })),
+    };
+  }
+
   async getPurchaseOrderById(
     organizationId: string,
     purchaseOrderId: string
-  ): Promise<{ xeroPoId: string; xeroPoNumber: string }> {
+  ): Promise<XeroOpenPurchaseOrder> {
+    if (purchaseOrderId.startsWith("DRY-") || !(await this.isConfiguredForOrg(organizationId))) {
+      return {
+        xeroPoId: purchaseOrderId,
+        xeroPoNumber: purchaseOrderId,
+        date: new Date().toISOString().slice(0, 10),
+        status: "AUTHORISED",
+        total: 0,
+        lineItems: [],
+      };
+    }
+
     const result = await this.xeroApiRequest<XeroPurchaseOrderResponse>(
       organizationId,
       "GET",
       `/PurchaseOrders/${purchaseOrderId}`
     );
 
-    const po = result.PurchaseOrders?.[0];
-    if (!po?.PurchaseOrderID || !po.PurchaseOrderNumber) {
-      throw new Error("Xero purchase order number not found");
+    const mapped = result.PurchaseOrders?.[0]
+      ? this.mapPurchaseOrder(result.PurchaseOrders[0])
+      : null;
+    if (!mapped) {
+      throw new XeroApiError("Xero purchase order number not found");
     }
-
-    return {
-      xeroPoId: po.PurchaseOrderID,
-      xeroPoNumber: po.PurchaseOrderNumber,
-    };
+    return mapped;
   }
 
   async createPurchaseOrder(
     organizationId: string,
     input: XeroPurchaseOrderInput
   ): Promise<{ xeroPoId: string; xeroPoNumber: string }> {
-    if (config.DRY_RUN || !(await this.isConfiguredForOrg(organizationId))) {
+    if (!(await this.isConfiguredForOrg(organizationId))) {
       const mockId = input.purchaseOrderNumber ?? `DRY-PO-${Date.now()}`;
-      logger.info({ organizationId, input, mockId }, "[DRY_RUN] Xero PO created");
+      logger.info({ organizationId, input, mockId }, "Xero not connected — mock PO created");
       return { xeroPoId: mockId, xeroPoNumber: mockId };
     }
+
+    logger.info({ organizationId }, "Calling live Xero API to create purchase order");
 
     return withRetry(async () => {
       const contactId = await this.resolveContactId(
@@ -407,59 +575,192 @@ class XeroService {
 
       const validationError = this.extractPurchaseOrderValidationError(result);
       if (validationError) {
-        throw new Error(`Xero purchase order validation failed: ${validationError}`);
+        throw new XeroApiError(`Xero purchase order validation failed: ${validationError}`);
       }
 
       const created = result.PurchaseOrders?.[0];
       if (!created?.PurchaseOrderID) {
-        throw new Error("Xero did not return a Purchase Order ID");
+        throw new XeroApiError("Xero did not return a Purchase Order ID");
       }
 
-      const confirmed = await this.getPurchaseOrderById(
-        organizationId,
-        created.PurchaseOrderID
-      );
-
-      if (
-        input.purchaseOrderNumber &&
-        confirmed.xeroPoNumber !== input.purchaseOrderNumber
-      ) {
-        logger.warn(
-          {
-            organizationId,
-            requestedOrderNumber: input.purchaseOrderNumber,
-            xeroOrderNumber: confirmed.xeroPoNumber,
-          },
-          "Xero assigned a different order number than requested"
-        );
-      }
-
+      const confirmed = await this.getPurchaseOrderById(organizationId, created.PurchaseOrderID);
       logger.info(
-        {
-          organizationId,
-          xeroPoId: confirmed.xeroPoId,
-          xeroOrderNumber: confirmed.xeroPoNumber,
-        },
+        { organizationId, xeroPoId: confirmed.xeroPoId, xeroOrderNumber: confirmed.xeroPoNumber },
         "Xero PO created"
       );
-
-      return confirmed;
+      return { xeroPoId: confirmed.xeroPoId, xeroPoNumber: confirmed.xeroPoNumber };
     });
+  }
+
+  async updatePurchaseOrder(
+    organizationId: string,
+    purchaseOrderId: string,
+    input: XeroPurchaseOrderInput
+  ): Promise<{ xeroPoId: string; xeroPoNumber: string; voidedAndRecreated?: boolean }> {
+    if (purchaseOrderId.startsWith("DRY-") || !(await this.isConfiguredForOrg(organizationId))) {
+      logger.info({ organizationId, purchaseOrderId, input }, "Xero not connected — mock PO update");
+      return {
+        xeroPoId: purchaseOrderId,
+        xeroPoNumber: input.purchaseOrderNumber ?? purchaseOrderId,
+      };
+    }
+
+    try {
+      const existing = await this.getPurchaseOrderById(organizationId, purchaseOrderId);
+      if (existing.status === "BILLED" || existing.status === "DELETED") {
+        throw new XeroApiError(`PO not editable (${existing.status})`);
+      }
+
+      const contactId = await this.resolveContactId(
+        organizationId,
+        input.supplierContactId,
+        input.contactName
+      );
+      const result = await this.xeroApiRequest<XeroPurchaseOrderResponse>(
+        organizationId,
+        "POST",
+        "/PurchaseOrders",
+        {
+          PurchaseOrders: [
+            {
+              PurchaseOrderID: purchaseOrderId,
+              Contact: { ContactID: contactId },
+              LineItems: input.lineItems.map((line) => ({
+                Description: line.description,
+                Quantity: line.quantity,
+                UnitAmount: line.unitAmount,
+                ...(line.itemCode ? { ItemCode: line.itemCode } : {}),
+              })),
+              Status: "AUTHORISED",
+            },
+          ],
+        }
+      );
+      const validationError = this.extractPurchaseOrderValidationError(result);
+      if (validationError) {
+        throw new XeroApiError(`Xero purchase order validation failed: ${validationError}`);
+      }
+      const updated = result.PurchaseOrders?.[0];
+      return {
+        xeroPoId: updated?.PurchaseOrderID ?? purchaseOrderId,
+        xeroPoNumber: updated?.PurchaseOrderNumber ?? existing.xeroPoNumber,
+      };
+    } catch (error) {
+      logger.warn({ err: error, purchaseOrderId }, "PO update failed — voiding and recreating");
+      await this.voidPurchaseOrder(organizationId, purchaseOrderId);
+      const created = await this.createPurchaseOrder(organizationId, input);
+      return { ...created, voidedAndRecreated: true };
+    }
+  }
+
+  async voidPurchaseOrder(organizationId: string, purchaseOrderId: string): Promise<void> {
+    if (purchaseOrderId.startsWith("DRY-") || !(await this.isConfiguredForOrg(organizationId))) {
+      logger.info({ organizationId, purchaseOrderId }, "Xero not connected — mock PO void");
+      return;
+    }
+
+    try {
+      await this.xeroApiRequest(organizationId, "POST", "/PurchaseOrders", {
+        PurchaseOrders: [{ PurchaseOrderID: purchaseOrderId, Status: "DELETED" }],
+      });
+    } catch (error) {
+      logger.warn({ err: error, purchaseOrderId }, "Could not delete Xero PO");
+    }
   }
 
   async convertPoToBill(
     organizationId: string,
     input: XeroBillInput
   ): Promise<{ xeroBillId: string }> {
-    if (config.DRY_RUN || !(await this.isConfiguredForOrg(organizationId))) {
+    if (!(await this.isConfiguredForOrg(organizationId))) {
       const mockId = `DRY-BILL-${Date.now()}`;
-      logger.info({ organizationId, input, mockId }, "[DRY_RUN] Xero bill created");
+      logger.info({ organizationId, input, mockId }, "Xero not connected — mock bill created");
       return { xeroBillId: mockId };
     }
 
+    logger.info({ organizationId }, "Calling live Xero API to create bill");
+
     return withRetry(async () => {
-      throw new Error("Xero bill creation from PO not yet implemented");
+      const contactId = await this.resolveContactId(
+        organizationId,
+        input.supplierContactId,
+        input.contactName
+      );
+      const lineItems = input.lineItems
+        .map((line) => ({
+          Description: line.description,
+          Quantity: line.quantity,
+          UnitAmount: line.unitAmount,
+          AccountCode: "400",
+          ...(line.itemCode ? { ItemCode: line.itemCode } : {}),
+        }))
+        .filter((line) => line.Description && line.Quantity > 0);
+      if (!lineItems.length) {
+        throw new XeroApiError("Xero bill is missing line items — the invoice had no usable rows");
+      }
+      const result = await this.xeroApiRequest<XeroInvoicesResponse>(
+        organizationId,
+        "PUT",
+        "/Invoices",
+        {
+          Invoices: [
+            {
+              Type: "ACCPAY",
+              Contact: { ContactID: contactId },
+              InvoiceNumber: input.invoiceNumber,
+              Date: input.invoiceDate,
+              DueDate: input.dueDate ?? input.invoiceDate,
+              Reference: input.purchaseOrderNumber,
+              Status: "AUTHORISED",
+              LineItems: lineItems,
+            },
+          ],
+        }
+      );
+
+      const created = result.Invoices?.[0];
+      if (!created?.InvoiceID) {
+        const errors = created?.ValidationErrors?.map((error) => error.Message).filter(Boolean);
+        throw new XeroApiError(
+          errors?.length ? `Xero bill validation failed: ${errors.join("; ")}` : "Xero bill not created"
+        );
+      }
+
+      if (input.attachmentPath) {
+        await this.attachInvoiceFile(
+          organizationId,
+          created.InvoiceID,
+          input.attachmentPath,
+          input.attachmentName
+        );
+      }
+
+      return { xeroBillId: created.InvoiceID };
     });
+  }
+
+  async attachInvoiceFile(
+    organizationId: string,
+    xeroBillId: string,
+    filePath: string,
+    filename?: string
+  ): Promise<void> {
+    if (!(await this.isConfiguredForOrg(organizationId))) {
+      logger.info({ organizationId, xeroBillId, filePath }, "Xero not connected — attachment skipped");
+      return;
+    }
+    if (xeroBillId.startsWith("DRY-")) return;
+
+    const buffer = await fs.readFile(filePath);
+    const name = filename ?? path.basename(filePath);
+    const ext = path.extname(name).toLowerCase();
+    const contentType =
+      ext === ".pdf"
+        ? "application/pdf"
+        : ext === ".png"
+          ? "image/png"
+          : "image/jpeg";
+    await this.xeroApiUpload(organizationId, xeroBillId, name, buffer, contentType);
   }
 
   async findDuplicateBill(
@@ -467,13 +768,28 @@ class XeroService {
     supplierContactId: string,
     invoiceNumber: string
   ): Promise<boolean> {
-    const existing = await prisma.xeroBill.findFirst({
+    const local = await prisma.xeroBill.findFirst({
       where: {
         invoiceNumber,
-        supplier: { organizationId, xeroContactId: supplierContactId },
+        supplier: { organizationId },
       },
     });
-    return Boolean(existing);
+    if (local) return true;
+
+    if (!(await this.isConfiguredForOrg(organizationId))) {
+      return false;
+    }
+
+    const escaped = invoiceNumber.replace(/"/g, '\\"');
+    const contactFilter = this.isXeroUuid(supplierContactId)
+      ? ` AND Contact.ContactID==Guid("${supplierContactId}")`
+      : "";
+    const result = await this.xeroApiRequest<XeroInvoicesResponse>(
+      organizationId,
+      "GET",
+      `/Invoices?where=Type=="ACCPAY" AND InvoiceNumber=="${escaped}"${contactFilter}`
+    );
+    return (result.Invoices ?? []).length > 0;
   }
 
   async updateBillStatus(
@@ -482,22 +798,155 @@ class XeroService {
     status: "AWAITING_PAYMENT" | "PAID",
     note?: string
   ): Promise<void> {
-    if (config.DRY_RUN || !(await this.isConfiguredForOrg(organizationId))) {
-      logger.info({ organizationId, xeroBillId, status, note }, "[DRY_RUN] Xero bill status updated");
+    if (!(await this.isConfiguredForOrg(organizationId))) {
+      logger.info({ organizationId, xeroBillId, status, note }, "Xero not connected — bill status skipped");
       return;
     }
+    if (xeroBillId.startsWith("DRY-")) return;
 
     await withRetry(async () => {
-      throw new Error("Xero bill status update not yet implemented");
+      if (status === "AWAITING_PAYMENT") {
+        await this.xeroApiRequest(organizationId, "POST", "/Invoices", {
+          Invoices: [{ InvoiceID: xeroBillId, Status: "AUTHORISED" }],
+        });
+        return;
+      }
+
+      const invoice = await this.xeroApiRequest<XeroInvoicesResponse>(
+        organizationId,
+        "GET",
+        `/Invoices/${xeroBillId}`
+      );
+      const amount = invoice.Invoices?.[0]?.AmountDue ?? invoice.Invoices?.[0]?.Total ?? 0;
+      await this.xeroApiRequest(organizationId, "PUT", "/Payments", {
+        Payments: [
+          {
+            Invoice: { InvoiceID: xeroBillId },
+            Account: { Code: "090" },
+            Date: new Date().toISOString().slice(0, 10),
+            Amount: amount,
+            Reference: note,
+          },
+        ],
+      });
     });
   }
 
-  async getOpenPurchaseOrders(_organizationId: string, _supplierContactId: string, _beforeDate: Date) {
-    return [];
+  async getOpenPurchaseOrders(
+    organizationId: string,
+    supplierContactId: string,
+    beforeDate: Date
+  ): Promise<XeroOpenPurchaseOrder[]> {
+    const local = await prisma.purchaseOrder.findMany({
+      where: {
+        status: { in: ["SUBMITTED", "AUTHORISED"] },
+        bills: { none: {} },
+        supplier: {
+          organizationId,
+          OR: [{ xeroContactId: supplierContactId }, { id: supplierContactId }],
+        },
+      },
+      include: { lines: true },
+      orderBy: { createdAt: "desc" },
+    });
+
+    const fromLocal: XeroOpenPurchaseOrder[] = local
+      .filter((po) => isWithinDaysBefore(po.createdAt, beforeDate))
+      .map((po) => ({
+        xeroPoId: po.xeroPoId ?? po.id,
+        xeroPoNumber: po.xeroPoNumber ?? po.id,
+        date: po.createdAt.toISOString().slice(0, 10),
+        status: po.status,
+        total: Number(po.totalAmount ?? 0),
+        lineItems: po.lines.map((line) => ({
+          description: line.itemName,
+          itemCode: line.xeroItemId ?? undefined,
+          quantity: Number(line.quantity),
+          unitAmount: Number(line.unitPrice ?? 0),
+        })),
+      }));
+
+    if (!(await this.isConfiguredForOrg(organizationId))) {
+      return fromLocal;
+    }
+
+    try {
+      const contactId = this.isXeroUuid(supplierContactId)
+        ? supplierContactId
+        : await this.resolveContactId(organizationId, supplierContactId);
+      const result = await this.xeroApiRequest<XeroPurchaseOrderResponse>(
+        organizationId,
+        "GET",
+        `/PurchaseOrders?where=Contact.ContactID==Guid("${contactId}") AND Status=="AUTHORISED"`
+      );
+      const fromXero = (result.PurchaseOrders ?? [])
+        .map((po) => this.mapPurchaseOrder(po))
+        .filter((po): po is XeroOpenPurchaseOrder => Boolean(po))
+        .filter((po) => {
+          const date = po.date ? new Date(po.date) : new Date();
+          return isWithinDaysBefore(date, beforeDate);
+        });
+      return fromXero.length ? fromXero : fromLocal;
+    } catch (error) {
+      logger.warn({ err: error }, "Falling back to local open POs");
+      await notifySupervisorOfXeroError("look up open purchase orders", error);
+      return fromLocal;
+    }
   }
 
-  async getBillsForPeriod(_organizationId: string, _supplierContactId: string, _start: Date, _end: Date) {
-    return [];
+  async getBillsForPeriod(
+    organizationId: string,
+    supplierContactId: string,
+    start: Date,
+    end: Date
+  ): Promise<XeroBillRecord[]> {
+    const local = await prisma.xeroBill.findMany({
+      where: {
+        invoiceDate: { gte: start, lte: end },
+        supplier: {
+          organizationId,
+          OR: [{ xeroContactId: supplierContactId }, { id: supplierContactId }],
+        },
+      },
+    });
+    const fromLocal: XeroBillRecord[] = local.map((bill) => ({
+      xeroBillId: bill.xeroBillId ?? bill.id,
+      invoiceNumber: bill.invoiceNumber ?? "UNKNOWN",
+      invoiceDate: (bill.invoiceDate ?? bill.createdAt).toISOString().slice(0, 10),
+      total: Number(bill.totalAmount ?? 0),
+      status: bill.status,
+    }));
+
+    if (!(await this.isConfiguredForOrg(organizationId))) {
+      return fromLocal;
+    }
+
+    try {
+      const contactId = this.isXeroUuid(supplierContactId)
+        ? supplierContactId
+        : await this.resolveContactId(organizationId, supplierContactId);
+      const startStr = start.toISOString().slice(0, 10);
+      const endStr = end.toISOString().slice(0, 10);
+      const result = await this.xeroApiRequest<XeroInvoicesResponse>(
+        organizationId,
+        "GET",
+        `/Invoices?where=Type=="ACCPAY" AND Contact.ContactID==Guid("${contactId}") AND Date>=DateTime(${startStr.replaceAll("-", ",")}) AND Date<=DateTime(${endStr.replaceAll("-", ",")})`
+      );
+      const fromXero = (result.Invoices ?? [])
+        .filter((invoice) => invoice.InvoiceID)
+        .map((invoice) => ({
+          xeroBillId: invoice.InvoiceID!,
+          invoiceNumber: invoice.InvoiceNumber ?? "UNKNOWN",
+          invoiceDate: (invoice.DateString ?? invoice.Date ?? "").slice(0, 10),
+          total: Number(invoice.Total ?? 0),
+          status: invoice.Status ?? "AUTHORISED",
+        }));
+      return fromXero.length ? fromXero : fromLocal;
+    } catch (error) {
+      logger.warn({ err: error }, "Falling back to local bills for period");
+      await notifySupervisorOfXeroError("look up bills for reconciliation", error);
+      return fromLocal;
+    }
   }
 }
 

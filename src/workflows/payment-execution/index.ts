@@ -8,6 +8,9 @@ import { xeroService } from "../../services/xero.service.js";
 import { whatsappService } from "../../services/whatsapp.service.js";
 import { approvalService } from "../../services/approval.service.js";
 import { auditService } from "../../services/audit.service.js";
+import { logger } from "../../utils/logger.js";
+import { logDone, logStep } from "../../utils/workflow-log.js";
+import { notifySupervisorOfXeroError } from "../../utils/xero-error.js";
 import type { PayableList } from "../../types/index.js";
 
 async function getSupervisorPhone(): Promise<string> {
@@ -42,11 +45,15 @@ export const paymentExecutionWorkflow = {
     });
 
     const hasPayee = await authorizationService.hasSavedPayee(reconciliation.supplierId);
-    if (!hasPayee) {
+    if (!hasPayee || !(await dbsPlaywrightService.payeeExists(reconciliation.supplier.dbsPayeeName ?? ""))) {
       await whatsappService.sendText(
         await getSupervisorPhone(),
-        `❌ No saved DBS payee for ${reconciliation.supplier.name}. Payment stopped.`
+        `❌ No saved DBS payee for ${reconciliation.supplier.name}. Payment stopped. The bot will not create new payees.`
       );
+      await prisma.workflowRun.update({
+        where: { id: workflowRun.id },
+        data: { status: WorkflowStatus.FAILED, error: "No saved DBS payee", completedAt: new Date() },
+      });
       return;
     }
 
@@ -72,6 +79,11 @@ export const paymentExecutionWorkflow = {
       where: { id: workflowRun.id },
       data: { currentStep: "4.3-standby", result: { paymentBatchId: batch.id } },
     });
+    logStep(
+      workflowRun.id,
+      "DBS standby",
+      `${payableList.supplierName} S$${payableList.totalAmount.toFixed(2)} — reply ready`
+    );
   },
 
   async onApprovalResolved(
@@ -83,24 +95,12 @@ export const paymentExecutionWorkflow = {
       return;
     }
 
+    const organizationId = getOrganizationId();
     const run = await prisma.workflowRun.findUniqueOrThrow({ where: { id: workflowRunId } });
     const result = run.result as { paymentBatchId?: string } | null;
     if (!result?.paymentBatchId) return;
 
-    const batch = await prisma.paymentBatch.findUniqueOrThrow({
-      where: { id: result.paymentBatchId },
-      include: { supplier: true, reconciliationRun: true },
-    });
-
-    const payableList = batch.reconciliationRun?.payableList as PayableList | null;
-    if (!payableList) return;
-
-    await prisma.paymentBatch.update({
-      where: { id: batch.id },
-      data: { status: PaymentBatchStatus.LOGGING_IN },
-    });
-
-    const sessionOk = await dbsPlaywrightService.isSessionAvailable();
+    const sessionOk = await dbsPlaywrightService.acquireSession(organizationId);
     if (!sessionOk) {
       await whatsappService.sendText(
         await getSupervisorPhone(),
@@ -109,48 +109,98 @@ export const paymentExecutionWorkflow = {
       return;
     }
 
-    const paymentResult = await dbsPlaywrightService.raisePayment(payableList);
-
-    await prisma.paymentBatch.update({
-      where: { id: batch.id },
-      data: {
-        status: PaymentBatchStatus.AWAITING_BANK_APPROVAL,
-        dbsTransactionRef: paymentResult.transactionRef,
-        raisedAt: new Date(),
-      },
-    });
-
-    for (const item of payableList.items) {
-      await xeroService.updateBillStatus(
-        getOrganizationId(),
-        item.xeroBillId,
-        "AWAITING_PAYMENT",
-        `DBS ref: ${paymentResult.transactionRef}`
-      );
-      await prisma.xeroBill.updateMany({
-        where: { xeroBillId: item.xeroBillId },
-        data: { status: "AWAITING_PAYMENT", dbsReference: paymentResult.transactionRef },
+    try {
+      const batches = await prisma.paymentBatch.findMany({
+        where: {
+          status: PaymentBatchStatus.STANDBY_REQUESTED,
+          supplier: { organizationId },
+        },
+        include: { supplier: true, reconciliationRun: true },
       });
+
+      const ordered = batches.sort((a, b) =>
+        a.id === result.paymentBatchId ? -1 : b.id === result.paymentBatchId ? 1 : 0
+      );
+
+      for (const batch of ordered) {
+        const payableList = batch.reconciliationRun?.payableList as PayableList | null;
+        if (!payableList) continue;
+
+        await prisma.paymentBatch.update({
+          where: { id: batch.id },
+          data: { status: PaymentBatchStatus.LOGGING_IN },
+        });
+
+        const paymentResult = await dbsPlaywrightService.raisePayment(payableList);
+
+        await prisma.paymentBatch.update({
+          where: { id: batch.id },
+          data: {
+            status: PaymentBatchStatus.AWAITING_BANK_APPROVAL,
+            dbsTransactionRef: paymentResult.transactionRef,
+            raisedAt: new Date(),
+          },
+        });
+
+        for (const item of payableList.items) {
+          try {
+            await xeroService.updateBillStatus(
+              organizationId,
+              item.xeroBillId,
+              "AWAITING_PAYMENT",
+              `DBS ref: ${paymentResult.transactionRef}`
+            );
+          } catch (error) {
+            await notifySupervisorOfXeroError(
+              `mark bill ${item.invoiceNumber} as awaiting payment`,
+              error
+            );
+            throw error;
+          }
+          await prisma.xeroBill.updateMany({
+            where: { xeroBillId: item.xeroBillId },
+            data: { status: "AWAITING_PAYMENT", dbsReference: paymentResult.transactionRef },
+          });
+        }
+
+        await whatsappService.sendText(
+          await getSupervisorPhone(),
+          `✅ Payment raised in DBS: ${batch.supplier.name} S$${Number(batch.totalAmount).toFixed(2)} — ref ${paymentResult.transactionRef}. Bills marked Awaiting Payment (not Paid).`
+        );
+        logDone(
+          workflowRunId,
+          "DBS payment raised",
+          `${batch.supplier.name} · ${paymentResult.transactionRef} · Awaiting Payment`
+        );
+
+        await auditService.log({
+          workflowRunId,
+          triggerEvent: "payment.raised",
+          actor: "payment-execution",
+          sourceChannel: "dbs",
+          outputs: { transactionRef: paymentResult.transactionRef, batchId: batch.id },
+          outcome: "success",
+        });
+      }
+
+      await prisma.workflowRun.update({
+        where: { id: workflowRunId },
+        data: { status: WorkflowStatus.COMPLETED, completedAt: new Date() },
+      });
+    } catch (error) {
+      logger.error({ err: error, workflowRunId }, "Payment execution failed after DBS raise");
+      await notifySupervisorOfXeroError("update Xero bills after raising the DBS payment", error);
+      await prisma.workflowRun.update({
+        where: { id: workflowRunId },
+        data: {
+          status: WorkflowStatus.FAILED,
+          error: error instanceof Error ? error.message : String(error),
+          completedAt: new Date(),
+        },
+      });
+    } finally {
+      await dbsPlaywrightService.releaseSession(organizationId);
     }
-
-    await whatsappService.sendText(
-      await getSupervisorPhone(),
-      `✅ Payment raised in DBS: ${batch.supplier.name} S$${Number(batch.totalAmount).toFixed(2)} — ref ${paymentResult.transactionRef}`
-    );
-
-    await prisma.workflowRun.update({
-      where: { id: workflowRunId },
-      data: { status: WorkflowStatus.COMPLETED, completedAt: new Date() },
-    });
-
-    await auditService.log({
-      workflowRunId,
-      triggerEvent: "payment.raised",
-      actor: "payment-execution",
-      sourceChannel: "dbs",
-      outputs: { transactionRef: paymentResult.transactionRef, batchId: batch.id },
-      outcome: "success",
-    });
   },
 
   async monitorApprovals(): Promise<void> {
@@ -171,23 +221,32 @@ export const paymentExecutionWorkflow = {
       if (!approved) continue;
 
       const billIds = batch.xeroBillIds as string[];
-      for (const billId of billIds) {
-        await xeroService.updateBillStatus(getOrganizationId(), billId, "PAID");
-        await prisma.xeroBill.updateMany({
-          where: { xeroBillId: billId },
-          data: { status: "PAID", paidAt: new Date() },
+      try {
+        for (const billId of billIds) {
+          await xeroService.updateBillStatus(organizationId, billId, "PAID");
+          await prisma.xeroBill.updateMany({
+            where: { xeroBillId: billId },
+            data: { status: "PAID", paidAt: new Date() },
+          });
+        }
+
+        await prisma.paymentBatch.update({
+          where: { id: batch.id },
+          data: { status: PaymentBatchStatus.APPROVED, approvedAt: new Date() },
         });
+
+        await whatsappService.sendText(
+          await getSupervisorPhone(),
+          `Payment to supplier approved and marked Paid in Xero. Ref: ${batch.dbsTransactionRef}`
+        );
+        logDone(undefined, "DBS approved · Xero Paid", batch.dbsTransactionRef);
+      } catch (error) {
+        logger.error({ err: error, batchId: batch.id }, "Failed to mark Xero bills Paid");
+        await notifySupervisorOfXeroError(
+          `mark bills as Paid after DBS approval (ref ${batch.dbsTransactionRef})`,
+          error
+        );
       }
-
-      await prisma.paymentBatch.update({
-        where: { id: batch.id },
-        data: { status: PaymentBatchStatus.APPROVED, approvedAt: new Date() },
-      });
-
-      await whatsappService.sendText(
-        await getSupervisorPhone(),
-        `Payment to supplier approved and marked Paid in Xero. Ref: ${batch.dbsTransactionRef}`
-      );
     }
   },
 };

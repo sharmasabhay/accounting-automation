@@ -13,6 +13,27 @@ const api = {
     localStorage.removeItem(TOKEN_KEY);
   },
 
+  async requestForm(path, formData) {
+    const token = this.getToken();
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: formData,
+    });
+
+    if (res.status === 401) {
+      this.clearToken();
+      window.location.reload();
+      throw new Error("Unauthorized");
+    }
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || data.message || `Request failed (${res.status})`);
+    }
+    return data;
+  },
+
   async request(path, options = {}) {
     const token = this.getToken();
     const headers = {
@@ -35,7 +56,9 @@ const api = {
     }
 
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+    if (!res.ok) {
+      throw new Error(data.error || data.message || `Request failed (${res.status})`);
+    }
     return data;
   },
 
@@ -88,6 +111,13 @@ const api = {
     });
   },
 
+  importXeroSuppliers(slug, contactIds) {
+    return this.request(`/api/organizations/${slug}/suppliers/import-xero`, {
+      method: "POST",
+      body: JSON.stringify(contactIds?.length ? { contactIds } : {}),
+    });
+  },
+
   getIntegrations(slug) {
     return this.request(`/api/organizations/${slug}/integrations`);
   },
@@ -117,8 +147,49 @@ const api = {
     return this.request(`/api/organizations/${slug}/xero/contacts`);
   },
 
+  listXeroItems(slug) {
+    return this.request(`/api/organizations/${slug}/xero/items`);
+  },
+
+  addSkuMapping(slug, supplierId, body) {
+    return this.request(`/api/organizations/${slug}/suppliers/${supplierId}/sku-mappings`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
+
+  removeSkuMapping(slug, supplierId, mappingId) {
+    return this.request(`/api/organizations/${slug}/suppliers/${supplierId}/sku-mappings/${mappingId}`, {
+      method: "DELETE",
+    });
+  },
+
+  resetOperational(slug) {
+    return this.request(`/api/organizations/${slug}/test/reset-operational`, {
+      method: "POST",
+      body: "{}",
+    });
+  },
+
   getWorkflows(slug) {
     return this.request(`/api/organizations/${slug}/workflows`);
+  },
+
+  getConversations(slug) {
+    return this.request(`/api/organizations/${slug}/conversations`);
+  },
+
+  replyConversation(slug, body) {
+    return this.request(`/api/organizations/${slug}/conversations/reply`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
+
+  clearConversations(slug) {
+    return this.request(`/api/organizations/${slug}/conversations`, {
+      method: "DELETE",
+    });
   },
 
   testPoIntake(slug, message) {
@@ -128,10 +199,47 @@ const api = {
     });
   },
 
-  testWhatsAppWebhook(slug, message) {
+  testWhatsAppWebhook(slug, message, extra = {}) {
     return this.request(`/api/organizations/${slug}/test/whatsapp-webhook`, {
       method: "POST",
+      body: JSON.stringify({ message, ...extra }),
+    });
+  },
+
+  getPurchaseOrders(slug) {
+    return this.request(`/api/organizations/${slug}/purchase-orders`);
+  },
+
+  testInvoice(slug, fileList) {
+    const fd = new FormData();
+    for (const file of fileList) fd.append("files", file);
+    return this.requestForm(`/api/organizations/${slug}/test/invoice`, fd);
+  },
+
+  testEmailScan(slug, body = {}) {
+    const fd = new FormData();
+    for (const file of body.files || []) fd.append("files", file);
+    if (body.from) fd.append("from", body.from);
+    if (body.subject) fd.append("subject", body.subject);
+    if (body.kind) fd.append("kind", body.kind);
+    return this.requestForm(`/api/organizations/${slug}/test/email-scan`, fd);
+  },
+
+  scanLiveInbox(slug) {
+    return this.request(`/api/organizations/${slug}/test/email-inbox`, { method: "POST" });
+  },
+
+  testReconcile(slug, message) {
+    return this.request(`/api/organizations/${slug}/test/reconcile`, {
+      method: "POST",
       body: JSON.stringify({ message }),
+    });
+  },
+
+  testDbsApprove(slug, transactionRef) {
+    return this.request(`/api/organizations/${slug}/test/dbs-approve`, {
+      method: "POST",
+      body: JSON.stringify({ transactionRef }),
     });
   },
 

@@ -1,11 +1,28 @@
 let currentOrg = null;
 let integrationSchemas = null;
+let selectedSkuSupplierId = "";
+let selectedSupplierChatId = "";
+let chatPollTimer = null;
+let lastChatSignature = "";
 
 function showToast(msg) {
   const el = document.getElementById("toast");
   el.textContent = msg;
   el.classList.remove("hidden");
-  setTimeout(() => el.classList.add("hidden"), 3000);
+  setTimeout(() => el.classList.add("hidden"), 4000);
+}
+
+async function uploadInvoiceFiles(fileList) {
+  if (!currentOrg) throw new Error("Open an organisation first");
+  const files = Array.from(fileList || []).filter((file) => file && file.size);
+  if (!files.length) throw new Error("Choose an invoice photo or PDF");
+  for (const file of files) {
+    if (file.size > 12 * 1024 * 1024) throw new Error(`${file.name} is larger than 12 MB`);
+  }
+  const result = await api.testInvoice(currentOrg.slug, files);
+  await renderWorkflows();
+  await refreshConversations(true);
+  return result;
 }
 
 function showApp() {
@@ -98,9 +115,17 @@ async function renderOrg(slug) {
   closeEditSupplier();
   renderTeamTable();
   renderSupplierTable();
+  renderSkuPanel();
     await renderIntegrations();
     await renderWorkflows();
+    await renderOpenPos();
+    fillEmailInvoiceFrom();
     document.getElementById("load-xero-contacts-btn")?.addEventListener("click", loadXeroContacts);
+    if (!document.getElementById("tab-activity").classList.contains("hidden")) {
+      startChatPolling();
+    } else {
+      lastChatSignature = "";
+    }
   }
 
 function renderTeamTable() {
@@ -136,6 +161,7 @@ function renderSupplierTable() {
       <td>${esc(s.emailDomain || "—")}</td>
       <td>${esc(s.whatsappGroupId || "—")}</td>
       <td>${esc(s.dbsPayeeName || "—")}</td>
+      <td>${s.skuMappings?.length ?? 0}</td>
       <td class="actions-cell">
         <button type="button" class="btn sm edit-supplier-btn" data-id="${esc(s.id)}">Edit</button>
         <button type="button" class="btn sm danger remove-supplier-btn" data-id="${esc(s.id)}" data-name="${esc(s.name)}">
@@ -147,8 +173,53 @@ function renderSupplierTable() {
     .join("");
 
   el.innerHTML = `<table>
-    <thead><tr><th>Name</th><th>Xero Contact ID</th><th>Email domain</th><th>WA Group</th><th>DBS Payee</th><th></th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="6" class="muted">No suppliers</td></tr>'}</tbody>
+    <thead><tr><th>Name</th><th>Xero Contact ID</th><th>Email domain</th><th>WA Group</th><th>DBS Payee</th><th>SKUs</th><th></th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="7" class="muted">No suppliers</td></tr>'}</tbody>
+  </table>`;
+}
+
+function currentSkuSupplier() {
+  return currentOrg?.suppliers.find((s) => s.id === selectedSkuSupplierId) ?? currentOrg?.suppliers[0] ?? null;
+}
+
+function renderSkuPanel() {
+  const select = document.getElementById("sku-supplier-select");
+  const list = document.getElementById("sku-mapping-list");
+  if (!select || !list || !currentOrg) return;
+
+  if (!currentOrg.suppliers.some((s) => s.id === selectedSkuSupplierId)) {
+    selectedSkuSupplierId = currentOrg.suppliers[0]?.id || "";
+  }
+
+  select.innerHTML = currentOrg.suppliers.length
+    ? currentOrg.suppliers
+        .map(
+          (s) =>
+            `<option value="${esc(s.id)}" ${s.id === selectedSkuSupplierId ? "selected" : ""}>${esc(s.name)}</option>`
+        )
+        .join("")
+    : `<option value="">No suppliers</option>`;
+
+  const supplier = currentSkuSupplier();
+  const mappings = supplier?.skuMappings ?? [];
+  const rows = mappings
+    .map(
+      (m) => `<tr>
+      <td>${esc(m.supplierItemName)}</td>
+      <td><code>${esc(m.xeroItemCode || m.xeroItemId)}</code></td>
+      <td class="muted">${esc(m.confirmedBy || "—")}</td>
+      <td class="actions-cell">
+        <button type="button" class="btn sm danger remove-sku-btn" data-id="${esc(m.id)}" data-name="${esc(m.supplierItemName)}">
+          Remove
+        </button>
+      </td>
+    </tr>`
+    )
+    .join("");
+
+  list.innerHTML = `<table>
+    <thead><tr><th>PO item name</th><th>Xero item</th><th>Set by</th><th></th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="4" class="muted">No SKU mappings for this supplier</td></tr>'}</tbody>
   </table>`;
 }
 
@@ -174,6 +245,24 @@ function closeEditSupplier() {
   form.reset();
 }
 
+async function refreshSuppliers() {
+  if (!currentOrg) return;
+  currentOrg = await api.getOrg(currentOrg.slug);
+  renderSupplierTable();
+  renderSkuPanel();
+}
+
+async function importXeroSuppliers(contactIds) {
+  if (!currentOrg) return;
+  const result = await api.importXeroSuppliers(currentOrg.slug, contactIds);
+  const parts = [];
+  if (result.created) parts.push(`${result.created} added`);
+  if (result.updated) parts.push(`${result.updated} updated`);
+  showToast(parts.length ? `Imported from Xero: ${parts.join(", ")}` : "No Xero suppliers to import");
+  await refreshSuppliers();
+  return result;
+}
+
 async function loadXeroContacts() {
   const btn = document.getElementById("load-xero-contacts-btn");
   const el = document.getElementById("xero-contacts-list");
@@ -194,12 +283,17 @@ async function loadXeroContacts() {
         <td>${esc(c.name)}</td>
         <td><code class="copy-contact-id" title="Click to copy">${esc(c.contactId)}</code></td>
         <td>${esc(c.email || "—")}</td>
+        <td class="actions-cell">
+          <button type="button" class="btn sm import-xero-contact-btn" data-id="${esc(c.contactId)}" data-name="${esc(c.name)}">
+            Import
+          </button>
+        </td>
       </tr>`
       )
       .join("");
 
     el.innerHTML = `<table>
-      <thead><tr><th>Name in Xero</th><th>Contact ID (click to copy)</th><th>Email</th></tr></thead>
+      <thead><tr><th>Name in Xero</th><th>Contact ID (click to copy)</th><th>Email</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 
@@ -485,7 +579,7 @@ async function renderWorkflows() {
     .map(
       (w) => `<tr>
       <td><code>${w.type}</code></td>
-      <td><span class="badge ${w.status === "COMPLETED" ? "ok" : "warn"}">${w.status}</span></td>
+      <td><span class="badge ${w.status === "COMPLETED" ? "ok" : w.status === "FAILED" ? "off" : "warn"}">${w.status}</span></td>
       <td>${esc(w.currentStep || "—")}</td>
       <td>${new Date(w.createdAt).toLocaleString()}</td>
     </tr>`
@@ -499,6 +593,172 @@ async function renderWorkflows() {
     </table>`;
 }
 
+function money(value) {
+  if (value == null || value === "") return "—";
+  const amount = Number(value);
+  if (Number.isNaN(amount)) return String(value);
+  return `S$${amount.toFixed(2)}`;
+}
+
+async function renderOpenPos() {
+  const el = document.getElementById("open-po-list");
+  if (!el || !currentOrg) return;
+  try {
+    const orders = await api.getPurchaseOrders(currentOrg.slug);
+    if (!orders.length) {
+      el.innerHTML = `<p class="muted">No open POs. You can still upload — the bot will ask whether to create a PO from the invoice.</p>`;
+      return;
+    }
+    const rows = orders
+      .map((po) => {
+        const lines = (po.lines || [])
+          .map((line) => `${line.itemName} × ${line.quantity}${line.unit ? ` ${line.unit}` : ""}`)
+          .join(", ");
+        return `<tr>
+          <td>${esc(po.supplier?.name || "—")}</td>
+          <td><code>${esc(po.xeroPoNumber || po.id)}</code></td>
+          <td>${esc(po.status)}</td>
+          <td>${new Date(po.createdAt).toLocaleDateString()}</td>
+          <td>${money(po.totalAmount)}</td>
+          <td class="po-lines">${esc(lines || "—")}</td>
+        </tr>`;
+      })
+      .join("");
+    el.innerHTML = `<table>
+      <thead><tr><th>Supplier</th><th>PO</th><th>Status</th><th>Date</th><th>Total</th><th>Lines</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  } catch (err) {
+    el.innerHTML = `<p class="muted">Could not load POs: ${esc(err.message)}</p>`;
+  }
+}
+
+function fillEmailInvoiceFrom() {
+  const input = document.getElementById("email-invoice-from");
+  if (!input || input.value.trim()) return;
+  const supplier = currentOrg?.suppliers?.find((s) => s.emailDomain);
+  if (supplier?.emailDomain) input.placeholder = `ap@${supplier.emailDomain}`;
+}
+
+function stopChatPolling() {
+  if (chatPollTimer) {
+    clearInterval(chatPollTimer);
+    chatPollTimer = null;
+  }
+}
+
+function startChatPolling() {
+  stopChatPolling();
+  refreshConversations();
+  chatPollTimer = setInterval(() => {
+    if (document.getElementById("tab-activity")?.classList.contains("hidden")) return;
+    refreshConversations();
+    renderWorkflows();
+  }, 2000);
+}
+
+function chatSignature(data) {
+  const last = data.messages?.[data.messages.length - 1];
+  return `${data.messages?.length ?? 0}:${last?.id ?? ""}:${data.supervisorPhone ?? ""}:${(data.suppliers || []).map((s) => s.id).join(",")}`;
+}
+
+function formatChatTime(iso) {
+  try {
+    return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+function renderChatLog(el, messages, emptyText) {
+  if (!el) return;
+
+  if (!messages.length) {
+    el.innerHTML = `<div class="chat-empty">${esc(emptyText)}</div>`;
+    return;
+  }
+
+  el.innerHTML = messages
+    .map((m) => {
+      const isOut = m.direction === "outbound" || m.sender === "bot";
+      const who = isOut
+        ? "Bot"
+        : m.sender === "supplier"
+          ? m.supplierName || "Supplier"
+          : "You (supervisor)";
+      return `<div class="chat-bubble ${isOut ? "out" : "in"}">
+        <span class="chat-meta">${esc(who)} · ${esc(formatChatTime(m.createdAt))}</span>
+        ${esc(m.text)}
+      </div>`;
+    })
+    .join("");
+
+  el.scrollTop = el.scrollHeight;
+}
+
+async function refreshConversations(force = false) {
+  if (!currentOrg) return;
+  const supervisorLog = document.getElementById("supervisor-chat-log");
+  const supplierLog = document.getElementById("supplier-chat-log");
+  if (!supervisorLog || !supplierLog) return;
+
+  try {
+    const data = await api.getConversations(currentOrg.slug);
+    const signature = chatSignature(data);
+    if (!force && signature === lastChatSignature) return;
+
+    const prevSignature = lastChatSignature;
+    lastChatSignature = signature;
+
+    const meta = document.getElementById("supervisor-chat-meta");
+    if (meta) {
+      meta.textContent = data.supervisorName
+        ? `${data.supervisorName} · ${data.supervisorPhone || ""}`
+        : data.supervisorPhone || "No supervisor";
+    }
+
+    const select = document.getElementById("supplier-chat-select");
+    const suppliers = data.suppliers || [];
+    if (select) {
+      if (!suppliers.some((s) => s.id === selectedSupplierChatId)) {
+        selectedSupplierChatId = suppliers[0]?.id || "";
+      }
+      select.innerHTML = suppliers.length
+        ? suppliers
+            .map(
+              (s) =>
+                `<option value="${esc(s.id)}" ${s.id === selectedSupplierChatId ? "selected" : ""}>${esc(s.name)}</option>`
+            )
+            .join("")
+        : `<option value="">No suppliers</option>`;
+    }
+
+    const supervisorMsgs = (data.messages || []).filter((m) => m.channel === "SUPERVISOR");
+    const supplierMsgs = (data.messages || []).filter((m) => {
+      if (m.channel !== "SUPPLIER") return false;
+      if (!selectedSupplierChatId) return true;
+      return !m.supplierId || m.supplierId === selectedSupplierChatId;
+    });
+
+    renderChatLog(
+      supervisorLog,
+      supervisorMsgs,
+      "This is your private chat with the bot. Send an order like “Beetroot 2 kg”."
+    );
+    renderChatLog(
+      supplierLog,
+      supplierMsgs,
+      "Empty until the bot posts a confirmed PO for this supplier. Then reply here as the supplier."
+    );
+
+    if (prevSignature && prevSignature !== signature) {
+      renderWorkflows().catch(() => {});
+    }
+  } catch {
+    /* keep last rendered chat if polling fails */
+  }
+}
+
 function initTabs() {
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.onclick = () => {
@@ -506,6 +766,8 @@ function initTabs() {
       document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
       tab.classList.add("active");
       document.getElementById(`tab-${tab.dataset.tab}`).classList.remove("hidden");
+      if (tab.dataset.tab === "activity") startChatPolling();
+      else stopChatPolling();
     };
   });
 }
@@ -573,8 +835,7 @@ function initForms() {
     try {
       await api.addSupplier(currentOrg.slug, Object.fromEntries(fd.entries()));
       showToast("Supplier added");
-      currentOrg = await api.getOrg(currentOrg.slug);
-      renderSupplierTable();
+      await refreshSuppliers();
       e.target.reset();
     } catch (err) {
       showToast(err.message);
@@ -599,14 +860,41 @@ function initForms() {
       await api.updateSupplier(currentOrg.slug, supplierId, body);
       showToast("Supplier updated");
       closeEditSupplier();
-      currentOrg = await api.getOrg(currentOrg.slug);
-      renderSupplierTable();
+      await refreshSuppliers();
     } catch (err) {
       showToast(err.message);
     }
   };
 
   document.getElementById("cancel-edit-supplier-btn")?.addEventListener("click", closeEditSupplier);
+
+  document.getElementById("import-xero-suppliers-btn")?.addEventListener("click", async () => {
+    const btn = document.getElementById("import-xero-suppliers-btn");
+    if (!currentOrg || !btn) return;
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = "Importing…";
+    try {
+      await importXeroSuppliers();
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  });
+
+  document.getElementById("xero-contacts-list")?.addEventListener("click", async (e) => {
+    const btn = e.target.closest(".import-xero-contact-btn");
+    if (!btn || !currentOrg) return;
+    btn.disabled = true;
+    try {
+      await importXeroSuppliers([btn.dataset.id]);
+    } catch (err) {
+      showToast(err.message);
+      btn.disabled = false;
+    }
+  });
 
   document.getElementById("team-list")?.addEventListener("click", async (e) => {
     const btn = e.target.closest(".remove-member-btn");
@@ -648,10 +936,128 @@ function initForms() {
     try {
       await api.removeSupplier(currentOrg.slug, supplierId);
       showToast("Supplier removed");
-      currentOrg = await api.getOrg(currentOrg.slug);
-      renderSupplierTable();
+      await refreshSuppliers();
     } catch (err) {
       showToast(err.message);
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById("sku-supplier-select")?.addEventListener("change", (e) => {
+    selectedSkuSupplierId = e.target.value;
+    renderSkuPanel();
+  });
+
+  document.getElementById("add-sku-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const supplier = currentSkuSupplier();
+    if (!currentOrg || !supplier) {
+      showToast("Add a supplier first");
+      return;
+    }
+
+    const fd = new FormData(e.target);
+    const itemSelect = document.getElementById("sku-xero-item-select");
+    const selectedOption = itemSelect?.selectedOptions?.[0];
+    const xeroItemId = selectedOption?.value || "";
+    const xeroItemCode =
+      selectedOption?.dataset.code || fd.get("xeroItemCode") || xeroItemId;
+
+    if (!fd.get("supplierItemName") || !xeroItemCode) {
+      showToast("Item name and Xero item code are required");
+      return;
+    }
+
+    try {
+      await api.addSkuMapping(currentOrg.slug, supplier.id, {
+        supplierItemName: fd.get("supplierItemName"),
+        xeroItemId: xeroItemId || xeroItemCode,
+        xeroItemCode,
+      });
+      showToast(`Mapped "${fd.get("supplierItemName")}" for ${supplier.name}`);
+      e.target.reset();
+      if (itemSelect) itemSelect.selectedIndex = 0;
+      currentOrg = await api.getOrg(currentOrg.slug);
+      renderSupplierTable();
+      renderSkuPanel();
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
+  document.getElementById("load-xero-items-btn")?.addEventListener("click", async () => {
+    const select = document.getElementById("sku-xero-item-select");
+    const btn = document.getElementById("load-xero-items-btn");
+    if (!currentOrg || !select || !btn) return;
+    btn.disabled = true;
+    try {
+      const { items } = await api.listXeroItems(currentOrg.slug);
+      if (!items?.length) {
+        select.innerHTML = `<option value="">No items in Xero</option>`;
+        showToast("No Xero items found");
+        return;
+      }
+      select.innerHTML =
+        `<option value="">Select a Xero item</option>` +
+        items
+          .map(
+            (item) =>
+              `<option value="${esc(item.itemId)}" data-code="${esc(item.code)}">${esc(item.code)} — ${esc(item.name)}</option>`
+          )
+          .join("");
+      showToast(`Loaded ${items.length} Xero item(s)`);
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById("sku-mapping-list")?.addEventListener("click", async (e) => {
+    const btn = e.target.closest(".remove-sku-btn");
+    const supplier = currentSkuSupplier();
+    if (!btn || !currentOrg || !supplier) return;
+    if (!confirm(`Remove SKU mapping "${btn.dataset.name}"?`)) return;
+    btn.disabled = true;
+    try {
+      await api.removeSkuMapping(currentOrg.slug, supplier.id, btn.dataset.id);
+      showToast("SKU mapping removed");
+      currentOrg = await api.getOrg(currentOrg.slug);
+      renderSupplierTable();
+      renderSkuPanel();
+    } catch (err) {
+      showToast(err.message);
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById("reset-operational-btn")?.addEventListener("click", async () => {
+    if (!currentOrg) return;
+    if (
+      !confirm(
+        "Delete all purchase orders, SKU mappings, bills, invoices, and workflow runs for this organisation? Suppliers and integrations stay."
+      )
+    ) {
+      return;
+    }
+    const btn = document.getElementById("reset-operational-btn");
+    btn.disabled = true;
+    try {
+      const result = await api.resetOperational(currentOrg.slug);
+      const deleted = result.deleted || {};
+      showToast(
+        `Reset: ${deleted.purchaseOrders ?? 0} POs, ${deleted.skuMappings ?? 0} SKUs, ${deleted.workflowRuns ?? 0} workflows`
+      );
+      currentOrg = await api.getOrg(currentOrg.slug);
+      renderSupplierTable();
+      renderSkuPanel();
+      await renderWorkflows();
+      await renderOpenPos();
+      lastChatSignature = "";
+      await refreshConversations(true);
+    } catch (err) {
+      showToast(err.message);
+    } finally {
       btn.disabled = false;
     }
   });
@@ -661,8 +1067,9 @@ function initForms() {
     const fd = new FormData(e.target);
     try {
       await api.testPoIntake(currentOrg.slug, fd.get("message"));
-      showToast("PO intake test queued — check worker logs");
+      showToast("PO intake test queued — watch the Supervisor chat");
       await renderWorkflows();
+      await refreshConversations(true);
     } catch (err) {
       showToast(err.message);
     }
@@ -677,14 +1084,219 @@ function initForms() {
     btn.disabled = true;
     try {
       const result = await api.testWhatsAppWebhook(currentOrg.slug, message);
-      showToast(`Webhook ${result.status} — job queued (message ${result.messageId})`);
+      showToast(`Webhook ${result.status} — watch the Supervisor chat`);
       await renderWorkflows();
+      await refreshConversations(true);
     } catch (err) {
       showToast(err.message);
     } finally {
       btn.disabled = false;
     }
   };
+
+  document.getElementById("test-group-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      const result = await api.testWhatsAppWebhook(currentOrg.slug, fd.get("message") || "@bot remove zucchini", {
+        isGroup: true,
+        groupId: fd.get("groupId") || currentOrg.suppliers?.[0]?.whatsappGroupId || "test-group",
+      });
+      showToast(`Group webhook ${result.status}`);
+      await renderWorkflows();
+      await refreshConversations(true);
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
+  document.getElementById("test-invoice-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const input = e.target.querySelector('input[type="file"]');
+    const btn = e.target.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
+    try {
+      showToast("Reading invoice — PDFs can take up to a minute");
+      await uploadInvoiceFiles(input?.files);
+      showToast("Invoice processed — check Supervisor chat");
+      e.target.reset();
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  document.querySelector('#test-invoice-form input[type="file"]')?.addEventListener("change", async (e) => {
+    if (!e.target.files?.length) return;
+    const btn = document.querySelector('#test-invoice-form button[type="submit"]');
+    if (btn) btn.disabled = true;
+    try {
+      showToast("Reading invoice — PDFs can take up to a minute");
+      await uploadInvoiceFiles(e.target.files);
+      showToast("Invoice processed — check Supervisor chat");
+      e.target.value = "";
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  document.getElementById("test-email-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const btn = e.target.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
+    try {
+      const files = Array.from(e.target.querySelector('input[type="file"]')?.files || []).filter(
+        (file) => file && file.size
+      );
+      if (!files.length) throw new Error("Choose an invoice photo or PDF");
+      const filename = files[0]?.name || "";
+      const result = await api.testEmailScan(currentOrg.slug, {
+        files,
+        from: fd.get("from") || undefined,
+        subject: fd.get("subject") || filename || "Invoice",
+        kind: /soa|statement/i.test(`${fd.get("subject") || ""} ${filename}`) ? "soa" : "invoice",
+      });
+      showToast(`Email scan queued (${result.attachments} file${result.attachments === 1 ? "" : "s"})`);
+      e.target.reset();
+      fillEmailInvoiceFrom();
+      await renderWorkflows();
+      await refreshConversations(true);
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  document.getElementById("scan-live-inbox")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    if (!currentOrg) return;
+    btn.disabled = true;
+    try {
+      showToast("Scanning live IMAP inbox…");
+      const result = await api.scanLiveInbox(currentOrg.slug);
+      const skipped = (result.skipped || []).length;
+      showToast(
+        `Inbox ${result.mailbox || ""}: ${result.attachments || 0} attachment(s), ${result.invoices || 0} invoice(s), ${result.soa || 0} SOA, ${skipped} skipped`
+      );
+      await renderWorkflows();
+      await refreshConversations(true);
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById("test-reconcile-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api.testReconcile(currentOrg.slug, fd.get("message") || "Please reconcile payment for Fresh Farms");
+      showToast("Reconciliation started");
+      await renderWorkflows();
+      await refreshConversations(true);
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
+  document.getElementById("test-dbs-approve-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      const result = await api.testDbsApprove(currentOrg.slug, fd.get("transactionRef") || undefined);
+      showToast(`Simulated DBS approval ${result.transactionRef}`);
+      await renderWorkflows();
+      await refreshConversations(true);
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
+  async function sendChatReply(channel, form) {
+    if (!currentOrg) return;
+    const fd = new FormData(form);
+    const message = String(fd.get("message") || "").trim();
+    const fileInput = form.querySelector('input[type="file"]');
+    const attached = fileInput?.files?.[0];
+    if (!message && !attached) return;
+    const btn = form.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
+    try {
+      if (attached) {
+        showToast("Reading invoice — PDFs can take up to a minute");
+        await uploadInvoiceFiles([attached]);
+        showToast("Invoice processed — check this chat");
+      } else {
+        await api.replyConversation(currentOrg.slug, {
+          channel,
+          message,
+          supplierId: channel === "supplier" ? selectedSupplierChatId : undefined,
+        });
+      }
+      form.reset();
+      fileInput?.closest(".chat-file-btn")?.classList.remove("has-file");
+      await refreshConversations(true);
+      await renderWorkflows();
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  document.getElementById("supervisor-chat-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    await sendChatReply("supervisor", e.target);
+  });
+
+  document.getElementById("supervisor-chat-form")?.querySelector('input[type="file"]')?.addEventListener("change", async (e) => {
+    const input = e.target;
+    input.closest(".chat-file-btn")?.classList.toggle("has-file", Boolean(input.files?.[0]));
+    if (!input.files?.[0]) return;
+    const btn = document.querySelector('#supervisor-chat-form button[type="submit"]');
+    if (btn) btn.disabled = true;
+    try {
+      showToast("Reading invoice — PDFs can take up to a minute");
+      await uploadInvoiceFiles(input.files);
+      showToast("Invoice processed — check this chat");
+      input.value = "";
+      input.closest(".chat-file-btn")?.classList.remove("has-file");
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  document.getElementById("supplier-chat-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    await sendChatReply("supplier", e.target);
+  });
+
+  document.getElementById("supplier-chat-select")?.addEventListener("change", (e) => {
+    selectedSupplierChatId = e.target.value;
+    lastChatSignature = "";
+    refreshConversations(true);
+  });
+
+  document.getElementById("clear-chats-btn")?.addEventListener("click", async () => {
+    if (!currentOrg) return;
+    if (!confirm("Clear supervisor and supplier chat history for this organisation?")) return;
+    try {
+      await api.clearConversations(currentOrg.slug);
+      lastChatSignature = "";
+      await refreshConversations(true);
+      showToast("Chats cleared");
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
 }
 
 function esc(s) {
@@ -700,6 +1312,7 @@ async function route() {
   document.querySelectorAll(".nav-link").forEach((l) => l.classList.remove("active"));
 
   if (parts[0] === "new") {
+    stopChatPolling();
     document.querySelector('[data-route="new"]')?.classList.add("active");
     renderNew();
   } else if (parts[0] === "org" && parts[1]) {
@@ -713,8 +1326,11 @@ async function route() {
       });
       document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
       document.getElementById(`tab-${tab}`)?.classList.remove("hidden");
+      if (tab === "activity") startChatPolling();
+      else stopChatPolling();
     }
   } else {
+    stopChatPolling();
     document.querySelector('[data-route="list"]')?.classList.add("active");
     await renderList();
   }

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { xeroService } from "../../services/xero.service.js";
+import { logger } from "../../utils/logger.js";
 
 export async function registerXeroAuthRoutes(app: FastifyInstance): Promise<void> {
   app.get("/auth/xero/callback", async (request, reply) => {
@@ -32,6 +33,7 @@ export async function registerXeroAuthRoutes(app: FastifyInstance): Promise<void
 
       return reply.type("text/html").send(successPage(state.organizationSlug));
     } catch (error) {
+      logger.error({ err: error, url: request.url }, "Xero OAuth callback failed");
       const message = error instanceof Error ? error.message : "OAuth failed";
       return reply.code(500).type("text/html").send(errorPage(message));
     }

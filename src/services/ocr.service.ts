@@ -4,6 +4,10 @@ import { config } from "../config/index.js";
 import { logger } from "../utils/logger.js";
 import { withRetry } from "../utils/storage.js";
 import { llmService } from "./llm.service.js";
+import { integrationConfigService } from "./integration-config.service.js";
+import { localOcrService } from "./local-ocr.service.js";
+import { getOrganizationId } from "../context/tenant.js";
+import { hasCoreInvoiceFields } from "../utils/invoice-parse.js";
 import type { InvoiceExtraction } from "../types/index.js";
 
 const IMAGE_MIME_BY_EXT: Record<string, "image/jpeg" | "image/png" | "image/gif" | "image/webp"> = {
@@ -14,6 +18,17 @@ const IMAGE_MIME_BY_EXT: Record<string, "image/jpeg" | "image/png" | "image/gif"
   ".webp": "image/webp",
 };
 
+const CONFIDENCE_THRESHOLD = 0.75;
+
+function minFieldConfidence(extraction: InvoiceExtraction): number {
+  const fields = [
+    extraction.supplier.confidence,
+    extraction.invoiceNumber.confidence,
+    extraction.total.confidence,
+  ];
+  return Math.min(...fields);
+}
+
 class OcrService {
   async extractFromFile(
     filePath: string,
@@ -22,40 +37,85 @@ class OcrService {
     rawText: string;
     extraction: InvoiceExtraction;
   }> {
-    const useMock =
-      config.OCR_PROVIDER === "mock" && !config.ANTHROPIC_API_KEY;
+    const provider = await this.resolveProvider();
+    let local: { rawText: string; extraction: InvoiceExtraction } | null = null;
 
-    if (useMock) {
-      logger.warn(
-        "OCR_PROVIDER=mock and no ANTHROPIC_API_KEY — using fixed Fresh Farms sample data"
+    if (provider !== "claude") {
+      try {
+        local = await localOcrService.extract(filePath, mimeType);
+        if (
+          hasCoreInvoiceFields(local.extraction) ||
+          minFieldConfidence(local.extraction) >= CONFIDENCE_THRESHOLD
+        ) {
+          return local;
+        }
+      } catch (error) {
+        logger.warn({ err: error }, "Local OCR failed");
+      }
+    }
+
+    if (local && config.ANTHROPIC_API_KEY && !hasCoreInvoiceFields(local.extraction)) {
+      try {
+        const refined = await llmService.refineInvoiceExtraction(local.rawText);
+        if (
+          hasCoreInvoiceFields(refined) &&
+          minFieldConfidence(refined) > minFieldConfidence(local.extraction)
+        ) {
+          return { rawText: local.rawText, extraction: refined };
+        }
+      } catch (error) {
+        logger.warn({ err: error }, "Claude text refine failed — keeping local OCR");
+      }
+    }
+
+    if (local) return local;
+
+    if (!config.ANTHROPIC_API_KEY) {
+      throw new Error(
+        "Could not read that invoice with local OCR (Tesseract / Poppler). Send a clearer PDF or photo."
       );
-      return this.mockExtraction();
     }
 
-    if (config.ANTHROPIC_API_KEY) {
-      return withRetry(() => this.extractWithClaudeVision(filePath, mimeType), {
-        label: "ocr.claude-vision",
-      });
-    }
-
-    logger.warn(
-      { provider: config.OCR_PROVIDER },
-      "OCR provider not fully configured — falling back to mock"
-    );
-    return this.mockExtraction();
+    return withRetry(() => this.extractWithClaude(filePath, mimeType), {
+      label: "ocr.claude-vision",
+      maxAttempts: 2,
+      delaysMs: [2000],
+    });
   }
 
-  private async extractWithClaudeVision(
+  private async resolveProvider(): Promise<string> {
+    let provider = config.OCR_PROVIDER;
+    try {
+      const ocr = await integrationConfigService.getOcr(getOrganizationId());
+      if (ocr.provider) provider = ocr.provider;
+    } catch {
+      /* no org context */
+    }
+    return provider;
+  }
+
+  private async extractWithClaude(
     filePath: string,
     mimeType?: string
   ): Promise<{ rawText: string; extraction: InvoiceExtraction }> {
     const buffer = await fs.readFile(filePath);
-    const resolvedMime = this.resolveImageMime(filePath, mimeType);
+    const ext = path.extname(filePath).toLowerCase();
+    const isPdf = mimeType === "application/pdf" || ext === ".pdf";
 
+    if (isPdf) {
+      logger.info({ file: path.basename(filePath), bytes: buffer.length }, "Reading invoice PDF with Claude");
+      const extraction = await llmService.extractInvoiceFromPdf(buffer.toString("base64"));
+      return {
+        rawText: `Claude PDF extraction for ${path.basename(filePath)}`,
+        extraction,
+      };
+    }
+
+    const resolvedMime = this.resolveImageMime(filePath, mimeType);
     if (!resolvedMime) {
-      const kind = mimeType ?? (path.extname(filePath) || "unknown");
+      const kind = mimeType ?? (ext || "unknown");
       throw new Error(
-        `Unsupported invoice file type (${kind}). Please send a clear JPEG or PNG photo of the invoice.`
+        `Unsupported invoice file type (${kind}). Please send a clear JPEG, PNG, or PDF of the invoice.`
       );
     }
 
@@ -63,17 +123,6 @@ class OcrService {
       buffer.toString("base64"),
       resolvedMime
     );
-
-    logger.info(
-      {
-        supplier: extraction.supplier.value,
-        invoiceNumber: extraction.invoiceNumber.value,
-        total: extraction.total.value,
-        supplierConfidence: extraction.supplier.confidence,
-      },
-      "Invoice extracted via Claude vision"
-    );
-
     return {
       rawText: `Claude vision extraction for ${path.basename(filePath)}`,
       extraction,
@@ -95,28 +144,6 @@ class OcrService {
 
     const ext = path.extname(filePath).toLowerCase();
     return IMAGE_MIME_BY_EXT[ext] ?? null;
-  }
-
-  private mockExtraction(): { rawText: string; extraction: InvoiceExtraction } {
-    const extraction: InvoiceExtraction = {
-      supplier: { value: "Fresh Farms Pte Ltd", confidence: 0.95 },
-      invoiceNumber: { value: "INV-2026-0001", confidence: 0.98 },
-      invoiceDate: { value: "2026-06-01", confidence: 0.97 },
-      lineItems: [
-        {
-          name: { value: "Bok Choy", confidence: 0.9 },
-          quantity: { value: 10, confidence: 0.95 },
-          unitAmount: { value: 3.5, confidence: 0.92 },
-        },
-      ],
-      total: { value: 35.0, confidence: 0.96 },
-      signedOrStamped: true,
-    };
-
-    return {
-      rawText: "Mock OCR output for development",
-      extraction,
-    };
   }
 }
 

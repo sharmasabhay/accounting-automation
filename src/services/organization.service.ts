@@ -168,6 +168,101 @@ class OrganizationService {
     });
   }
 
+  async importSuppliersFromXero(
+    organizationId: string,
+    contacts: Array<{ contactId: string; name: string; email?: string }>
+  ): Promise<{ created: string[]; updated: string[] }> {
+    const existing = await prisma.supplier.findMany({ where: { organizationId } });
+    const created: string[] = [];
+    const updated: string[] = [];
+
+    for (const contact of contacts) {
+      const name = contact.name.trim();
+      const contactId = contact.contactId.trim();
+      if (!name || !contactId) continue;
+
+      const domain = contact.email?.includes("@")
+        ? contact.email.split("@").pop()?.trim().toLowerCase()
+        : undefined;
+
+      const match =
+        existing.find((supplier) => supplier.xeroContactId === contactId) ??
+        existing.find(
+          (supplier) =>
+            !supplier.xeroContactId &&
+            supplier.name.trim().toLowerCase() === name.toLowerCase()
+        );
+
+      if (match) {
+        const saved = await prisma.supplier.update({
+          where: { id: match.id },
+          data: {
+            name,
+            xeroContactId: contactId,
+            isActive: true,
+            ...(domain ? { emailDomain: domain } : {}),
+            ...(!match.dbsPayeeName ? { dbsPayeeName: name } : {}),
+          },
+        });
+        Object.assign(match, saved);
+        updated.push(name);
+        continue;
+      }
+
+      const saved = await prisma.supplier.create({
+        data: {
+          organizationId,
+          name,
+          xeroContactId: contactId,
+          emailDomain: domain || null,
+          dbsPayeeName: name,
+        },
+      });
+      existing.push(saved);
+      created.push(name);
+    }
+
+    return { created, updated };
+  }
+
+  async resetOperationalData(organizationId: string): Promise<{
+    purchaseOrders: number;
+    skuMappings: number;
+    workflowRuns: number;
+  }> {
+    const [purchaseOrders, skuMappings, workflowRuns] = await prisma.$transaction(async (tx) => {
+      await tx.paymentBatch.deleteMany({
+        where: { supplier: { organizationId } },
+      });
+      await tx.reconciliationRun.deleteMany({
+        where: { supplier: { organizationId } },
+      });
+      await tx.xeroBill.deleteMany({
+        where: { supplier: { organizationId } },
+      });
+      const poResult = await tx.purchaseOrder.deleteMany({
+        where: { supplier: { organizationId } },
+      });
+      await tx.invoiceCandidate.deleteMany({
+        where: { supplier: { organizationId } },
+      });
+      const skuResult = await tx.supplierSkuMapping.deleteMany({
+        where: { supplier: { organizationId } },
+      });
+      await tx.followUpTask.deleteMany({
+        where: { workflowRun: { organizationId } },
+      });
+      await tx.approvalRequest.deleteMany({
+        where: { workflowRun: { organizationId } },
+      });
+      await tx.auditLogEntry.deleteMany({ where: { organizationId } });
+      const wfResult = await tx.workflowRun.deleteMany({ where: { organizationId } });
+      return [poResult.count, skuResult.count, wfResult.count] as const;
+    });
+
+    return { purchaseOrders, skuMappings, workflowRuns };
+  }
+
   async setIntegration(
     organizationId: string,
     type: IntegrationType,

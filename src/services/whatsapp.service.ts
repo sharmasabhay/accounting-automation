@@ -1,14 +1,21 @@
 import { logger } from "../utils/logger.js";
+import { logBotMessage } from "../utils/workflow-log.js";
 import { getOrganizationId } from "../context/tenant.js";
 import { integrationConfigService } from "./integration-config.service.js";
+import { conversationService } from "./conversation.service.js";
 
 class WhatsAppService {
-  async sendText(to: string, text: string): Promise<{ messageId: string }> {
+  async sendText(
+    to: string,
+    text: string,
+    options?: { isGroup?: boolean }
+  ): Promise<{ messageId: string }> {
     const organizationId = getOrganizationId();
     const wa = await integrationConfigService.getWhatsApp(organizationId);
 
     if (!integrationConfigService.isWhatsAppConfigured(wa)) {
-      logger.info({ organizationId, to, text }, "[DRY] WhatsApp message");
+      logBotMessage(to, text, true);
+      await conversationService.recordOutbound(to, text, Boolean(options?.isGroup));
       return { messageId: `dry-${Date.now()}` };
     }
 
@@ -33,12 +40,14 @@ class WhatsAppService {
     }
 
     const data = (await response.json()) as { messages: Array<{ id: string }> };
+    logBotMessage(to, text, false);
+    await conversationService.recordOutbound(to, text, Boolean(options?.isGroup));
     return { messageId: data.messages[0]?.id ?? "unknown" };
   }
 
   async sendGroupText(groupId: string, text: string): Promise<{ messageId: string }> {
     logger.info({ groupId, text }, "Sending group message");
-    return this.sendText(groupId, text);
+    return this.sendText(groupId, text, { isGroup: true });
   }
 
   async downloadMedia(mediaId: string): Promise<Buffer> {

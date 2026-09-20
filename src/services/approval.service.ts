@@ -1,9 +1,11 @@
-import { ApprovalGateType, ApprovalStatus } from "@prisma/client";
+import { ApprovalGateType, ApprovalStatus, WorkflowStatus, WorkflowType } from "@prisma/client";
 import { prisma } from "../db/client.js";
 import { whatsappService } from "./whatsapp.service.js";
 import { auditService } from "./audit.service.js";
 import { organizationService } from "./organization.service.js";
+import { followUpService } from "./follow-up.service.js";
 import { getOrganizationId } from "../context/tenant.js";
+import { logWaiting } from "../utils/workflow-log.js";
 
 export interface CreateApprovalInput {
   workflowRunId: string;
@@ -28,9 +30,14 @@ class ApprovalService {
     const supervisorPhone =
       (await organizationService.getSupervisorPhone(organizationId)) ?? "+6590000000";
 
+    const replyHint = (input.options ?? ["Yes", "No"]).join(" / ");
     await whatsappService.sendText(
       supervisorPhone,
-      `🔔 Approval required (${input.gateType}):\n${input.question}\n\nReply: ${(input.options ?? ["Yes", "No"]).join(" / ")}`
+      `🔔 Approval required (${input.gateType}):\n${input.question}\n\nReply: ${replyHint}`
+    );
+    logWaiting(
+      input.workflowRunId,
+      `Reply in Admin → Activity → Supervisor chat with: ${replyHint}`
     );
 
     await auditService.log({
@@ -41,6 +48,13 @@ class ApprovalService {
       sourceChannel: "system",
       inputs: { gateType: input.gateType, question: input.question },
       outcome: "pending",
+    });
+
+    await followUpService.schedule({
+      workflowRunId: input.workflowRunId,
+      organizationId,
+      targetPhone: supervisorPhone,
+      message: `Still waiting on: ${input.question}`,
     });
 
     return approval;
@@ -60,6 +74,8 @@ class ApprovalService {
       },
       include: { workflowRun: true },
     });
+
+    await followUpService.cancelForWorkflow(approval.workflowRunId);
 
     await auditService.log({
       workflowRunId: approval.workflowRunId,
@@ -90,6 +106,53 @@ class ApprovalService {
       orderBy: { createdAt: "desc" },
       include: { workflowRun: true },
     });
+  }
+
+  async supersedePendingInvoiceCaptures(
+    organizationId: string,
+    exceptRunId?: string
+  ): Promise<number> {
+    const pending = await prisma.approvalRequest.findMany({
+      where: {
+        status: ApprovalStatus.PENDING,
+        workflowRun: {
+          organizationId,
+          type: WorkflowType.INVOICE_CAPTURE,
+          ...(exceptRunId ? { id: { not: exceptRunId } } : {}),
+        },
+      },
+    });
+
+    if (!pending.length) return 0;
+
+    const runIds = [...new Set(pending.map((row) => row.workflowRunId))];
+    await prisma.approvalRequest.updateMany({
+      where: { id: { in: pending.map((row) => row.id) } },
+      data: {
+        status: ApprovalStatus.EXPIRED,
+        response: "superseded",
+        resolvedAt: new Date(),
+      },
+    });
+    await prisma.workflowRun.updateMany({
+      where: { id: { in: runIds } },
+      data: {
+        status: WorkflowStatus.CANCELLED,
+        error: "Superseded by a new invoice upload",
+        completedAt: new Date(),
+      },
+    });
+    for (const runId of runIds) {
+      await followUpService.cancelForWorkflow(runId);
+    }
+
+    const supervisorPhone =
+      (await organizationService.getSupervisorPhone(organizationId)) ?? "+6590000000";
+    await whatsappService.sendText(
+      supervisorPhone,
+      "Cancelled the previous invoice wait so I can process the file you just uploaded."
+    );
+    return pending.length;
   }
 }
 

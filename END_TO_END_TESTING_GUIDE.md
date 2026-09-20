@@ -6,6 +6,54 @@
 
 ---
 
+## First run — purchase order + SKU mapping
+
+Do this with `DRY_RUN=true`. Keep **two windows** open:
+
+1. **Admin** → your organisation
+2. **Worker terminal** (`npm run worker`) — look for `▶`, `⏳ WAITING`, `✅`, and a boxed **BOT MESSAGE**
+
+Skip invoice / DBS fixtures for this pass. The bot does **not** talk to you in Admin — when WhatsApp is not configured, answer in **Test webhook**.
+
+### Before you click anything
+
+- API (`npm run dev`) and worker (`npm run worker`) are running — restart both after this change
+- Organisation has a **Supervisor** phone and at least one **supplier** (e.g. Fresh Farms)
+- Xero is connected if you want the PO written to the test organisation
+- Create the item in Xero first (Products and services), or you can type its code by hand
+
+### Set up clean data
+
+| # | Where | What to do |
+|---|--------|------------|
+| 1 | **Activity** | **Reset PO & SKU data** — clears leftover POs, SKU maps, bills, and workflow rows. Suppliers and Xero stay. |
+| 2 | **Suppliers** | Choose the supplier. **Load Xero items**, then add a mapping: PO name `Bok choy` → that Xero item. (Leave mappings empty if you want the bot to *ask* for the SKU.) |
+
+### Click-by-click (PO only)
+
+| # | In Admin → Activity | What to type | What you should see in the worker |
+|---|---------------------|--------------|-----------------------------------|
+| 1 | **Test webhook** | `- Bok choy: 10 kg from Fresh Farms` | `▶ PO parsed` then `⏳ WAITING` |
+| 2 | **Test webhook** if it asks for SKU | Xero item code (or `yes` to skip) | `SKU mapping saved` then price or confirm |
+| 3 | **Test webhook** if it asks for price | `3.50` | Confirm prompt with supplier + priced lines |
+| 4 | **Test webhook** | `yes` | `✅ PO created` and `Calling live Xero API to create purchase order` |
+
+A mapped item skips the SKU question on the next order. A second order of the same item should reuse the last price.
+
+Refresh the workflow table after each click. Status should move **IN_PROGRESS → AWAITING_APPROVAL → COMPLETED**.
+
+If the worker only says `Processing job` and nothing else, stop it and run `npm run worker` again.
+
+Invoice / reconcile / DBS steps are later in this guide (Activity → **Invoice / DBS fixtures**).
+
+---
+
+**Who this is for:** Supervisors and operations staff who want to walk through the full purchase-to-payment process and confirm everything works.
+
+**What this system does:** It helps you go from “we need to order supplies” to “the supplier has been paid,” with less manual typing in WhatsApp, Xero, and DBS.
+
+---
+
 ## The big picture (four steps)
 
 ```
@@ -34,17 +82,32 @@ Ask your technical contact to confirm these are ready. You do **not** need to do
 - [ ] Your organisation exists (e.g. “Omakase Demo”)
 - [ ] At least one **supervisor** team member is added (with a WhatsApp phone number)
 - [ ] At least one **supplier** is added (name, and ideally Xero contact + DBS payee name)
-- [ ] **Xero** is connected under Integrations (optional for first practice runs)
+- [ ] **Xero** is connected under Integrations (required for live POs/bills; use a Xero demo/test organisation)
 - [ ] **WhatsApp** is configured if you want live messages (optional — Admin can simulate)
 
 ### Practice mode vs live mode
 
 | Mode | What it means |
 |------|----------------|
-| **Practice (recommended first)** | The system logs what it *would* do in Xero/DBS, but does not move real money or create live accounting entries. Safe for learning. |
-| **Live** | Real POs/bills in Xero and real payment requests in DBS. Only use after practice runs look correct. |
+| **Practice (recommended first)** | `DRY_RUN=true`: DBS payments are simulated. Xero POs/bills are written to your connected **test** organisation. No live bank session. |
+| **Live banking** | `DRY_RUN=false`: real DBS payment requests. Only use after practice runs look correct. |
 
 > **Tip:** For your first full walkthrough, stay in practice mode. Review the Activity tab and confirmations before going live.
+
+### DRY_RUN Admin fixtures
+
+With `DRY_RUN=true`, DBS writes are simulated (`[DRY_RUN] DBS payment raised`, IDs like `DRY-DBS-…`). Xero is live if the organisation is connected in Admin → Integrations — documents appear in the Xero test org. If Xero is not connected, POs/bills fall back to mock `DRY-PO-…` / `DRY-BILL-…` IDs. Local database rows still appear in **Activity**.
+
+On **Activity** you can also:
+
+| Button | What it does |
+|--------|----------------|
+| **Test webhook** | Supervisor DM (PO, or `Please reconcile…`) |
+| **Group message** | `@bot remove …` against the supplier WhatsApp group ID |
+| **Mock invoice photo** | Runs invoice capture with the Fresh Farms sample (when OCR is mock) |
+| **Email scan fixture** | One or two attachments; use `SOA` in the filename to test SOA detection |
+| **Reconcile** | Starts month-end reconciliation for a named supplier |
+| **Simulate DBS approved** | Marks the latest raised payment approved, then Paid in Xero |
 
 ---
 
@@ -407,7 +470,7 @@ No. A human must approve in DBS. The bot only prepares / raises the payment.
 In a supplier group, modifications that @tag the bot still need supervisor approval before the PO is changed.
 
 **What is “practice mode”?**  
-The system pretends to write to Xero and DBS and writes safe log messages instead. Use this until you trust the flow.
+`DRY_RUN=true` simulates DBS only. Xero still creates real POs and bills in the connected test organisation. Use this until you trust the banking flow.
 
 **Who do I call if Activity shows FAILED?**  
 Your technical contact. Share: organisation name, approximate time, and which step (PO / invoice / reconcile / pay).

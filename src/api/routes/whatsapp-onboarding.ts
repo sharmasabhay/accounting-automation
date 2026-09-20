@@ -4,6 +4,7 @@ import type { FastifyInstance } from "fastify";
 import { config } from "../../config/index.js";
 import { organizationService } from "../../services/organization.service.js";
 import { whatsappOnboardingService } from "../../services/whatsapp-onboarding.service.js";
+import { logger } from "../../utils/logger.js";
 
 const ONBOARDING_PAGE = path.join(config.projectRoot, "public/onboarding/whatsapp.html");
 
@@ -71,6 +72,7 @@ export async function registerWhatsAppOnboardingRoutes(app: FastifyInstance): Pr
         displayPhoneNumber: result.displayPhoneNumber,
       };
     } catch (error) {
+      logger.error({ err: error, url: request.url }, "WhatsApp onboarding completeSignup failed");
       const message = error instanceof Error ? error.message : "Onboarding failed";
       return reply.code(400).send({ error: message });
     }

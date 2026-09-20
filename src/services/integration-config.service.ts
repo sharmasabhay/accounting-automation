@@ -5,6 +5,7 @@ import type {
   DbsIntegrationConfig,
   EmailIntegrationConfig,
   IntegrationConfigMap,
+  OcrIntegrationConfig,
   WhatsAppIntegrationConfig,
   XeroIntegrationConfig,
 } from "../types/integrations.js";
@@ -85,6 +86,10 @@ class IntegrationConfigService {
       password: org.password,
       headless: org.headless ?? config.DBS_HEADLESS,
     };
+  }
+
+  async getOcr(organizationId: string): Promise<OcrIntegrationConfig> {
+    return loadOrgConfig(organizationId, IntegrationType.OCR);
   }
 
   isWhatsAppConfigured(cfg: WhatsAppIntegrationConfig): boolean {

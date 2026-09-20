@@ -4,8 +4,10 @@ dist/
 .env.local
 storage/invoices/*
 storage/audit-logs/*
+storage/conversations/*
 !storage/invoices/.gitkeep
 !storage/audit-logs/.gitkeep
+!storage/conversations/.gitkeep
 playwright/.auth/
 *.log
 .DS_Store

@@ -5,6 +5,7 @@ import { config } from "../config/index.js";
 export async function ensureStorageDirs(): Promise<void> {
   await fs.mkdir(config.invoicesPath, { recursive: true, mode: 0o700 });
   await fs.mkdir(config.auditLogPath, { recursive: true, mode: 0o700 });
+  await fs.mkdir(config.conversationsPath, { recursive: true, mode: 0o700 });
 }
 
 export async function saveUploadedFile(

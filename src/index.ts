@@ -3,8 +3,10 @@ import { config } from "./config/index.js";
 import { logger } from "./utils/logger.js";
 import { ensureStorageDirs } from "./utils/storage.js";
 import { disconnectDb } from "./db/client.js";
+import { installProcessErrorAlerts } from "./utils/error-alert.js";
 
 async function main(): Promise<void> {
+  installProcessErrorAlerts();
   logger.info(
     {
       env: config.NODE_ENV,

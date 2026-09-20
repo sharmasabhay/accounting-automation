@@ -33,7 +33,7 @@ DRY_RUN=true
 SUPERVISOR_PHONE=+6590000000
 ```
 
-`DRY_RUN=true` is recommended for development — Xero and DBS writes are simulated and logged instead of executed.
+`DRY_RUN=true` is recommended for development — DBS bank writes stay simulated. Xero POs, bills, and attachments are live whenever the org is connected (use a Xero demo/test organisation).
 
 ### 3. Start infrastructure (PostgreSQL + Redis)
 
@@ -323,7 +323,7 @@ storage/
 | `API_TOKEN` | Yes | Bearer token for protected API routes |
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `REDIS_URL` | Yes | Redis for BullMQ job queue |
-| `DRY_RUN` | No | `true` = simulate Xero/DBS writes (default: `true`) |
+| `DRY_RUN` | No | `true` = simulate DBS writes only (default: `true`). Xero is live if connected. |
 | `ANTHROPIC_API_KEY` | No | Claude API for parsing/extraction (falls back to mock) |
 | `XERO_CLIENT_ID` | No | Xero OAuth (required for live Xero integration) |
 | `WHATSAPP_API_TOKEN` | No | Meta WhatsApp API fallback (prefer per-org Embedded Signup) |

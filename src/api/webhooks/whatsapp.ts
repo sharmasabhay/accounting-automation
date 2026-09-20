@@ -5,6 +5,7 @@ import { logger } from "../../utils/logger.js";
 import { enqueueJob } from "../../jobs/queue.js";
 import { approvalService } from "../../services/approval.service.js";
 import { organizationService } from "../../services/organization.service.js";
+import { conversationService } from "../../services/conversation.service.js";
 import type { WhatsAppInboundMessage } from "../../types/index.js";
 
 interface RawWhatsAppMessage {
@@ -15,6 +16,8 @@ interface RawWhatsAppMessage {
   text?: { body: string };
   image?: { id: string; mime_type: string };
   document?: { id: string; mime_type: string; filename?: string };
+  group_id?: string;
+  context?: { group_id?: string; from?: string; id?: string };
 }
 
 interface WhatsAppWebhookPayload {
@@ -26,7 +29,11 @@ interface WhatsAppWebhookPayload {
       field?: string;
       value?: {
         messages?: RawWhatsAppMessage[];
-        metadata?: { phone_number_id?: string; display_phone_number?: string };
+        metadata?: {
+          phone_number_id?: string;
+          display_phone_number?: string;
+          organization_id?: string;
+        };
         contacts?: Array<{ wa_id: string }>;
       };
     }>;
@@ -42,17 +49,23 @@ function parseInboundMessage(
 ): WhatsAppInboundMessage {
   const text = raw.text?.body;
   const mentionsBot = text?.toLowerCase().includes("@bot") ?? false;
+  const groupId = raw.group_id ?? raw.context?.group_id;
+  const looksLikeGroup =
+    Boolean(groupId) ||
+    raw.from.includes("@g.us") ||
+    raw.from.toLowerCase().startsWith("group:");
 
   return {
     messageId: raw.id,
-    from: raw.from.startsWith("+") ? raw.from : `+${raw.from}`,
+    from: raw.from.startsWith("+") || looksLikeGroup ? raw.from.replace(/^group:/i, "") : `+${raw.from}`,
     timestamp: raw.timestamp,
     type: raw.type as WhatsAppInboundMessage["type"],
     text,
     mediaId: raw.image?.id ?? raw.document?.id,
     mimeType: raw.image?.mime_type ?? raw.document?.mime_type,
     filename: raw.document?.filename,
-    isGroup: false,
+    isGroup: looksLikeGroup,
+    groupId: groupId ?? (raw.from.includes("@g.us") ? raw.from : undefined),
     mentionsBot,
     whatsappPhoneNumberId,
     whatsappBusinessAccountId,
@@ -65,9 +78,35 @@ export function buildTestWebhookPayload(input: {
   phoneNumberId?: string;
   businessAccountId?: string;
   messageId?: string;
+  isGroup?: boolean;
+  groupId?: string;
+  type?: "text" | "image" | "document";
+  filename?: string;
+  organizationId?: string;
 }): WhatsAppWebhookPayload {
   const fromDigits = input.from.replace(/^\+/, "");
   const messageId = input.messageId ?? `wamid.admin-test-${Date.now()}`;
+  const type = input.type ?? "text";
+  const message: RawWhatsAppMessage = {
+    id: messageId,
+    from: fromDigits,
+    timestamp: String(Math.floor(Date.now() / 1000)),
+    type,
+    ...(type === "text" ? { text: { body: input.message } } : {}),
+    ...(type === "image" ? { image: { id: "mock-media", mime_type: "image/jpeg" } } : {}),
+    ...(type === "document"
+      ? {
+          document: {
+            id: "mock-media",
+            mime_type: "application/pdf",
+            filename: input.filename ?? "invoice.pdf",
+          },
+        }
+      : {}),
+    ...(input.isGroup || input.groupId
+      ? { group_id: input.groupId ?? "test-group" }
+      : {}),
+  };
 
   return {
     object: "whatsapp_business_account",
@@ -77,18 +116,11 @@ export function buildTestWebhookPayload(input: {
         changes: [
           {
             value: {
-              metadata: input.phoneNumberId
-                ? { phone_number_id: input.phoneNumberId }
-                : undefined,
-              messages: [
-                {
-                  id: messageId,
-                  from: fromDigits,
-                  timestamp: String(Math.floor(Date.now() / 1000)),
-                  type: "text",
-                  text: { body: input.message },
-                },
-              ],
+              metadata: {
+                ...(input.phoneNumberId ? { phone_number_id: input.phoneNumberId } : {}),
+                ...(input.organizationId ? { organization_id: input.organizationId } : {}),
+              },
+              messages: [message],
             },
           },
         ],
@@ -111,9 +143,11 @@ export async function processWhatsAppWebhook(
 
     for (const change of entry.changes ?? []) {
       const phoneNumberId = change.value?.metadata?.phone_number_id;
+      const organizationIdHint = change.value?.metadata?.organization_id;
 
       for (const message of change.value?.messages ?? []) {
         const inbound = parseInboundMessage(message, phoneNumberId, businessAccountId);
+        if (organizationIdHint) inbound.organizationId = organizationIdHint;
         lastMessageId = inbound.messageId;
 
         const organization = await organizationService.resolveFromWhatsApp(inbound);
@@ -125,6 +159,8 @@ export async function processWhatsAppWebhook(
           );
           continue;
         }
+
+        await conversationService.recordInbound(organization.id, inbound);
 
         if (inbound.text) {
           const response = inbound.text.trim();

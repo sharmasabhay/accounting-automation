@@ -166,12 +166,47 @@
           </form>
           <div id="supplier-list" class="table-wrap card"></div>
           <div class="card form-card" style="margin-top:1rem">
-            <h3>Xero supplier contacts</h3>
+            <h3>Supplier SKU mappings</h3>
             <p class="muted" style="margin-bottom:.75rem">
-              Load contacts from your connected Xero org. Copy the Contact ID into the add or edit supplier form,
-              or make sure the supplier name matches exactly.
+              Map the item name as it appears on a purchase order to a Xero item for that supplier.
+              Pre-map before testing a PO, or leave empty to practice the SKU confirmation prompt.
             </p>
-            <button type="button" id="load-xero-contacts-btn" class="btn primary">Load contacts from Xero</button>
+            <div class="form-row">
+              <label>Supplier</label>
+              <select id="sku-supplier-select"></select>
+            </div>
+            <form id="add-sku-form" class="form-row two-col">
+              <div>
+                <label>PO / supplier item name</label>
+                <input name="supplierItemName" required placeholder="Bok choy" />
+              </div>
+              <div>
+                <label>Xero item</label>
+                <select id="sku-xero-item-select">
+                  <option value="">Type a code below, or load items from Xero</option>
+                </select>
+              </div>
+              <div>
+                <label>Xero item code (if not selected)</label>
+                <input name="xeroItemCode" placeholder="BOK-CHOY" />
+              </div>
+              <div class="form-actions" style="align-items:flex-end">
+                <button type="submit" class="btn primary">Add mapping</button>
+                <button type="button" id="load-xero-items-btn" class="btn">Load Xero items</button>
+              </div>
+            </form>
+            <div id="sku-mapping-list" class="table-wrap" style="margin-top:1rem"></div>
+          </div>
+          <div class="card form-card" style="margin-top:1rem">
+            <h3>Xero suppliers</h3>
+            <p class="muted" style="margin-bottom:.75rem">
+              Import supplier contacts from the connected Xero organisation. Matches existing rows by
+              Contact ID or name, sets the Xero Contact ID, and adds any new suppliers.
+            </p>
+            <div class="form-actions">
+              <button type="button" id="import-xero-suppliers-btn" class="btn primary">Import from Xero</button>
+              <button type="button" id="load-xero-contacts-btn" class="btn">Preview contacts</button>
+            </div>
             <div id="xero-contacts-list" class="table-wrap" style="margin-top:1rem"></div>
           </div>
         </div>
@@ -185,6 +220,61 @@
         </div>
 
         <div id="tab-activity" class="tab-panel hidden">
+          <div class="card form-card">
+            <div class="chat-toolbar">
+              <div>
+                <h3>Test conversations</h3>
+                <p class="muted">
+                  Two separate chats, like WhatsApp. Left is you talking to the bot.
+                  Right is the supplier talking to the bot after an order is posted.
+                </p>
+              </div>
+              <button type="button" id="clear-chats-btn" class="btn sm">Clear chats</button>
+            </div>
+            <div class="chat-grid">
+              <section class="chat-box chat-box-supervisor">
+                <header class="chat-box-header">
+                  <div>
+                    <strong>Supervisor ↔ Bot</strong>
+                    <div id="supervisor-chat-meta" class="muted chat-header-sub"></div>
+                  </div>
+                </header>
+                <p class="chat-role-hint">Private chat. Place orders, upload an invoice, and answer the bot here (yes / no / price).</p>
+                <div id="supervisor-chat-log" class="chat-log"></div>
+                <form id="supervisor-chat-form" class="chat-compose">
+                  <textarea name="message" rows="2" placeholder="Type as supervisor… e.g. Beetroot 2 kg"></textarea>
+                  <label class="chat-file-btn" title="Attach invoice photo or PDF — processing starts on select">
+                    <input type="file" name="file" accept="image/jpeg,image/png,image/webp,image/gif,application/pdf,.pdf" />
+                    Invoice
+                  </label>
+                  <button type="submit" class="btn primary">Send</button>
+                </form>
+              </section>
+              <section class="chat-box chat-box-supplier">
+                <header class="chat-box-header">
+                  <div>
+                    <strong>Supplier ↔ Bot</strong>
+                    <div class="muted chat-header-sub">Order thread with this supplier</div>
+                  </div>
+                  <select id="supplier-chat-select" aria-label="Supplier"></select>
+                </header>
+                <p class="chat-role-hint">The bot posts confirmed POs here. Reply as the supplier to change an order.</p>
+                <div id="supplier-chat-log" class="chat-log"></div>
+                <form id="supplier-chat-form" class="chat-compose">
+                  <textarea name="message" rows="2" placeholder="Type as supplier… e.g. remove zucchini"></textarea>
+                  <button type="submit" class="btn primary">Send</button>
+                </form>
+              </section>
+            </div>
+          </div>
+          <div class="card form-card">
+            <h3>Clean PO / SKU test data</h3>
+            <p class="muted" style="margin-bottom:.75rem">
+              Deletes local purchase orders, SKU mappings, bills, invoices, and workflow runs.
+              Keeps the organisation, team, suppliers, and Xero/WhatsApp connections.
+            </p>
+            <button type="button" id="reset-operational-btn" class="btn danger">Reset PO &amp; SKU data</button>
+          </div>
           <div class="card form-card">
             <h3>Test PO intake</h3>
             <p class="muted" style="margin-bottom:.75rem">
@@ -206,6 +296,64 @@
               <button type="submit" class="btn primary">Test webhook</button>
             </form>
           </div>
+          <div class="card form-card" style="margin-top:1rem">
+            <h3>Invoice capture</h3>
+            <p class="muted" style="margin-bottom:.75rem">
+              Upload a real invoice photo or PDF. Local OCR reads the file, matches it to an open PO
+              below (same supplier, PO dated within 10 days before the invoice date, exact quantity,
+              total ± S$0.10), then creates the Xero bill and attaches the original file.
+            </p>
+            <h4 class="invoice-subhead">Open purchase orders to match</h4>
+            <div id="open-po-list" class="table-wrap po-match-table"></div>
+            <form id="test-invoice-form" class="invoice-upload-form">
+              <label>Team WhatsApp upload</label>
+              <p class="muted" style="margin-bottom:.5rem">
+                Choose a PDF or photo — processing starts as soon as you pick the file. PDFs can take up to a minute.
+              </p>
+              <div class="form-row">
+                <input type="file" name="files" accept="image/jpeg,image/png,image/webp,image/gif,application/pdf,.pdf" multiple />
+                <button type="submit" class="btn primary">Process invoice</button>
+              </div>
+            </form>
+            <form id="test-email-form" class="invoice-upload-form">
+              <label>Simulate an email (file upload)</label>
+              <p class="muted" style="margin-bottom:.5rem">
+                Pretends the file arrived by email. From-address domain must match a supplier Email domain.
+              </p>
+              <input type="file" name="files" accept="image/jpeg,image/png,image/webp,image/gif,application/pdf" multiple />
+              <div class="form-row" style="margin-top:.5rem">
+                <input name="from" id="email-invoice-from" placeholder="ap@supplier-domain.com" />
+                <input name="subject" placeholder="Invoice" />
+                <button type="submit" class="btn">Process email</button>
+              </div>
+            </form>
+            <div class="invoice-upload-form" style="margin-top:1rem">
+              <label>Live IMAP inbox</label>
+              <p class="muted" style="margin-bottom:.5rem">
+                Reads unread mail from Admin → Integrations → EMAIL. Sender domain must match the supplier Email domain. Attachments are parsed with local OCR like WhatsApp uploads.
+              </p>
+              <button type="button" id="scan-live-inbox" class="btn primary">Scan live inbox now</button>
+            </div>
+          </div>
+          <details class="card form-card" style="margin-top:1rem">
+            <summary>Reconcile / DBS (later)</summary>
+            <p class="muted" style="margin:.75rem 0">
+              Keep <code>DRY_RUN=true</code> so DBS stays simulated. Xero writes go to the connected test organisation.
+            </p>
+            <form id="test-group-form" class="form-row" style="margin-bottom:.5rem">
+              <input name="message" placeholder="@bot remove zucchini" style="flex:1" />
+              <input name="groupId" placeholder="WhatsApp group ID" style="flex:1" />
+              <button type="submit" class="btn">Group message</button>
+            </form>
+            <form id="test-reconcile-form" class="form-row" style="margin-bottom:.5rem">
+              <input name="message" placeholder="Please reconcile payment for Fresh Farms" style="flex:1" />
+              <button type="submit" class="btn">Reconcile</button>
+            </form>
+            <form id="test-dbs-approve-form" class="form-row">
+              <input name="transactionRef" placeholder="DRY-DBS-… (blank = latest)" style="flex:1" />
+              <button type="submit" class="btn">Simulate DBS approved</button>
+            </form>
+          </details>
           <div id="workflow-list" class="table-wrap card"></div>
         </div>
       </div>

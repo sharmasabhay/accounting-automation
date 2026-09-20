@@ -418,4 +418,4 @@ Also confirm https://sg.omakase.pet still works (unchanged).
 | `sg` broke | You changed sg DNS — revert it to the **old instance public DNS** |
 | Jobs stuck | `pm2 logs omakase-worker` |
 
-Keep `DRY_RUN=true` until a practice run succeeds.
+Keep `DRY_RUN=true` until a practice run succeeds. DBS stays simulated; Xero writes go to the connected test organisation.

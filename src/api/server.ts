@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import multipart from "@fastify/multipart";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { config } from "../config/index.js";
@@ -9,6 +10,7 @@ import { registerOrganizationRoutes } from "./routes/organizations.js";
 import { registerXeroAuthRoutes } from "./routes/xero-auth.js";
 import { registerWhatsAppOnboardingRoutes } from "./routes/whatsapp-onboarding.js";
 import { prisma } from "../db/client.js";
+import { reportBackendError } from "../utils/error-alert.js";
 
 const PUBLIC_PATHS = [
   "/health",
@@ -32,9 +34,17 @@ export async function createServer() {
   const app = Fastify({
     logger: false,
     trustProxy: true,
+    bodyLimit: 20 * 1024 * 1024,
   });
 
   await app.register(cors, { origin: true });
+  await app.register(multipart, {
+    limits: {
+      fileSize: 12 * 1024 * 1024,
+      files: 5,
+      parts: 20,
+    },
+  });
 
   app.get("/admin", async (_request, reply) => {
     const html = await fs.readFile(path.join(ADMIN_ROOT, "index.html"));
@@ -118,6 +128,37 @@ export async function createServer() {
   await registerXeroAuthRoutes(app);
   await registerWhatsAppRoutes(app);
   await registerWhatsAppOnboardingRoutes(app);
+
+  app.setErrorHandler(async (error, request, reply) => {
+    const err = error instanceof Error ? error : new Error(String(error));
+    const statusCode =
+      error && typeof error === "object" && "statusCode" in error && typeof error.statusCode === "number"
+        ? error.statusCode
+        : 500;
+    const status = statusCode >= 400 ? statusCode : 500;
+
+    if (status !== 401 && status !== 404) {
+      await reportBackendError({
+        source: "api",
+        error: err,
+        context: {
+          method: request.method,
+          url: request.url,
+          params: request.params,
+          query: request.query,
+          body: request.body,
+          ip: request.ip,
+        },
+      });
+    }
+
+    logger.error({ err, url: request.url, method: request.method, status }, "Unhandled API error");
+
+    return reply.code(status).send({
+      error: status >= 500 ? "Internal Server Error" : err.message,
+      message: err.message,
+    });
+  });
 
   return app;
 }

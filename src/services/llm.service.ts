@@ -1,10 +1,17 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { config } from "../config/index.js";
-import { SYSTEM_PROMPT, PO_PARSE_PROMPT, INVOICE_EXTRACT_PROMPT } from "../prompts/system.js";
+import {
+  SYSTEM_PROMPT,
+  PO_PARSE_PROMPT,
+  INVOICE_EXTRACT_PROMPT,
+  SOA_EXTRACT_PROMPT,
+} from "../prompts/system.js";
+import { parsePurchaseOrderLocal } from "../utils/matching.js";
 import type {
   ParsedOrderItem,
   ParsePurchaseOrderResult,
   InvoiceExtraction,
+  SoaExtraction,
 } from "../types/index.js";
 
 class LlmService {
@@ -21,7 +28,7 @@ class LlmService {
   async parsePurchaseOrder(message: string): Promise<ParsePurchaseOrderResult> {
     // Prefer deterministic format parsing for the documented "Item: qty unit" lines.
     // This must work even when the Anthropic API key is missing or invalid.
-    const local = this.parseFormattedPurchaseOrder(message);
+    const local = parsePurchaseOrderLocal(message);
     if (local.isPurchaseOrder) {
       return local;
     }
@@ -46,14 +53,16 @@ class LlmService {
         isPurchaseOrder?: boolean;
         items?: Array<ParsedOrderItem & { supplier?: string }>;
         reason?: string;
+        supplierName?: string;
       };
 
       const items = (parsed.items ?? [])
         .filter((item) => item.itemName?.trim() && Number(item.quantity) > 0)
-        .map(({ itemName, quantity, unit }) => ({
+        .map(({ itemName, quantity, unit, supplier }) => ({
           itemName: itemName.trim(),
           quantity: Number(quantity),
           unit: unit ?? undefined,
+          supplier: supplier ?? parsed.supplierName ?? undefined,
         }));
 
       const isPurchaseOrder = Boolean(parsed.isPurchaseOrder) && items.length > 0;
@@ -62,6 +71,7 @@ class LlmService {
         isPurchaseOrder,
         items: isPurchaseOrder ? items : [],
         reason: parsed.reason ?? (isPurchaseOrder ? undefined : "Not a purchase order"),
+        supplierName: parsed.supplierName ?? items[0]?.supplier,
       };
     } catch {
       // Fall back to local result (usually empty) instead of failing the whole PO flow
@@ -120,8 +130,75 @@ class LlmService {
     return this.parseExtraction(this.extractText(response));
   }
 
+  async extractInvoiceFromPdf(pdfBase64: string): Promise<InvoiceExtraction> {
+    const client = this.getClient();
+    if (!client) {
+      return this.emptyExtraction();
+    }
+
+    const response = await client.messages.create(
+      {
+        model: config.ANTHROPIC_MODEL,
+        max_tokens: 2048,
+        system: SYSTEM_PROMPT,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "document",
+                source: {
+                  type: "base64",
+                  media_type: "application/pdf",
+                  data: pdfBase64,
+                },
+              },
+              { type: "text", text: INVOICE_EXTRACT_PROMPT },
+            ] as Anthropic.Messages.ContentBlockParam[],
+          },
+        ],
+      },
+      {
+        timeout: 120_000,
+        headers: { "anthropic-beta": "pdfs-2024-09-25" },
+      }
+    );
+
+    return this.parseExtraction(this.extractText(response));
+  }
+
+  async extractSoa(rawText: string): Promise<SoaExtraction> {
+    const client = this.getClient();
+    if (!client) {
+      return { invoices: [], balanceDue: 0 };
+    }
+
+    const response = await client.messages.create({
+      model: config.ANTHROPIC_MODEL,
+      max_tokens: 2048,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: `${SOA_EXTRACT_PROMPT}\n\nDocument:\n${rawText}` }],
+    });
+
+    try {
+      return JSON.parse(this.extractText(response)) as SoaExtraction;
+    } catch {
+      return { invoices: [], balanceDue: 0 };
+    }
+  }
+
   private parseExtraction(text: string): InvoiceExtraction {
-    return JSON.parse(text) as InvoiceExtraction;
+    const cleaned = text.replace(/```json\n?|\n?```/g, "").trim();
+    try {
+      return JSON.parse(cleaned) as InvoiceExtraction;
+    } catch {
+      const start = cleaned.indexOf("{");
+      const end = cleaned.lastIndexOf("}");
+      if (start >= 0 && end > start) {
+        return JSON.parse(cleaned.slice(start, end + 1)) as InvoiceExtraction;
+      }
+      throw new Error("Could not read invoice fields from that PDF. Try a clearer photo instead.");
+    }
   }
 
   private emptyExtraction(): InvoiceExtraction {
@@ -138,48 +215,6 @@ class LlmService {
     const block = response.content.find((b) => b.type === "text");
     if (!block || block.type !== "text") throw new Error("No text in LLM response");
     return block.text.replace(/```json\n?|\n?```/g, "").trim();
-  }
-
-  private parseFormattedPurchaseOrder(message: string): ParsePurchaseOrderResult {
-    const lines = message
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter(Boolean);
-
-    const items: ParsedOrderItem[] = [];
-
-    for (const line of lines) {
-      // Matches:
-      // - Bok choy: 10 kg
-      // * Zucchini: 40kg
-      // Item1: 5
-      const match = line.match(
-        /^[-*•]?\s*(.+?)\s*:\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?\s*$/i
-      );
-      if (!match) continue;
-
-      const itemName = match[1]!.trim();
-      const quantity = parseFloat(match[2]!);
-      if (!itemName || !(quantity > 0)) continue;
-
-      // Ignore help-like fake "items"
-      if (/^(help|hi|hello|yes|no|ready|approve)$/i.test(itemName)) continue;
-
-      items.push({
-        itemName,
-        quantity,
-        unit: match[3] || undefined,
-      });
-    }
-
-    return {
-      isPurchaseOrder: items.length > 0,
-      items,
-      reason:
-        items.length > 0
-          ? "Matched item: quantity format"
-          : "No item: quantity lines found",
-    };
   }
 }
 

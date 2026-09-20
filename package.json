@@ -17,24 +17,30 @@
     "db:studio": "prisma studio",
     "db:seed": "tsx prisma/seed.ts",
     "worker": "tsx src/jobs/worker.ts",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "tsx --test src/utils/matching.test.ts src/utils/invoice-parse.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
     "@fastify/cors": "^10.0.2",
+    "@fastify/multipart": "^10.1.1",
     "@prisma/client": "^6.3.1",
     "bullmq": "^5.34.8",
     "dotenv": "^16.4.7",
     "fastify": "^5.2.1",
     "imapflow": "^1.0.184",
     "ioredis": "^5.4.2",
+    "nodemailer": "^8.0.11",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
     "playwright": "^1.50.1",
+    "tesseract.js": "^7.0.0",
+    "unpdf": "^1.7.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/node": "^22.13.4",
+    "@types/nodemailer": "^8.0.2",
     "prisma": "^6.3.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"

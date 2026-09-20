@@ -2,17 +2,46 @@ import { WorkflowType, WorkflowStatus } from "@prisma/client";
 import { prisma } from "../db/client.js";
 import { auditService } from "../services/audit.service.js";
 import { organizationService } from "../services/organization.service.js";
+import { authorizationService } from "../services/authorization.service.js";
+import { emailService } from "../services/email.service.js";
+import { followUpService } from "../services/follow-up.service.js";
+import { conversationService } from "../services/conversation.service.js";
 import { poIntakeWorkflow } from "../workflows/po-intake/index.js";
 import { invoiceCaptureWorkflow } from "../workflows/invoice-capture/index.js";
 import { reconciliationWorkflow } from "../workflows/reconciliation/index.js";
 import { paymentExecutionWorkflow } from "../workflows/payment-execution/index.js";
 import { withOrganization } from "../context/tenant.js";
-import type { WorkflowEvent, WhatsAppInboundMessage } from "../types/index.js";
+import { saveUploadedFile } from "../utils/storage.js";
+import { isSoaDocument } from "../utils/matching.js";
+import type { WorkflowEvent, WhatsAppInboundMessage, SavedEmailAttachment } from "../types/index.js";
 import { logger } from "../utils/logger.js";
+import { logStep } from "../utils/workflow-log.js";
+import { reportBackendError } from "../utils/error-alert.js";
 
 class Orchestrator {
   async handleEvent(event: WorkflowEvent): Promise<void> {
+    try {
+      await this.dispatch(event);
+    } catch (error) {
+      await reportBackendError({
+        source: "workflow",
+        error,
+        context: { eventType: event.type, payload: event.payload },
+      });
+      throw error;
+    }
+  }
+
+  private async dispatch(event: WorkflowEvent): Promise<void> {
     logger.info({ eventType: event.type }, "Orchestrator received event");
+    if (event.type === "whatsapp.message") {
+      const text = event.payload.text?.slice(0, 120) ?? `(${event.payload.type})`;
+      logStep(
+        undefined,
+        event.payload.isGroup ? "Group WhatsApp" : "WhatsApp DM",
+        `${event.payload.from}: ${text}`
+      );
+    }
 
     switch (event.type) {
       case "whatsapp.message":
@@ -20,7 +49,19 @@ class Orchestrator {
         break;
       case "email.scan":
         await withOrganization(event.payload.organizationId, () =>
-          this.runEmailScan()
+          this.runEmailScan(event.payload.attachments)
+        );
+        break;
+      case "invoice.capture":
+        await withOrganization(event.payload.organizationId, () =>
+          invoiceCaptureWorkflow.processInvoice(
+            event.payload.workflowRunId,
+            event.payload.filePath,
+            event.payload.source,
+            event.payload.sourceRef,
+            event.payload.notifyPhone,
+            event.payload.mimeType
+          )
         );
         break;
       case "approval.resolved":
@@ -36,6 +77,11 @@ class Orchestrator {
       case "payment.monitor":
         await withOrganization(event.payload.organizationId, () =>
           paymentExecutionWorkflow.monitorApprovals()
+        );
+        break;
+      case "follow-up":
+        await withOrganization(event.payload.organizationId, () =>
+          followUpService.handleDue(event.payload.taskId)
         );
         break;
     }
@@ -66,7 +112,7 @@ class Orchestrator {
         return;
       }
 
-      if (text.includes("remove") || text.includes("modify") || text.includes("change")) {
+      if (text.includes("remove") || text.includes("modify") || text.includes("change") || text.includes("add")) {
         const run = await this.createRun(WorkflowType.PO_INTAKE, message.messageId);
         await poIntakeWorkflow.handleModification(run.id, message);
         return;
@@ -90,9 +136,90 @@ class Orchestrator {
     await poIntakeWorkflow.start(run.id, message);
   }
 
-  private async runEmailScan(): Promise<void> {
-    const run = await this.createRun(WorkflowType.INVOICE_CAPTURE, `email-scan-${Date.now()}`);
-    await invoiceCaptureWorkflow.startFromEmailScan(run.id);
+  async scanEmailInboxNow(organizationId: string) {
+    return withOrganization(organizationId, () => this.runEmailScan());
+  }
+
+  private async runEmailScan(savedAttachments?: SavedEmailAttachment[]): Promise<{
+    attachments: number;
+    invoices: number;
+    soa: number;
+    skipped: Array<{ from: string; filename: string; reason: string }>;
+  }> {
+    const organizationId = (await import("../context/tenant.js")).getOrganizationId();
+    const attachments = savedAttachments?.length
+      ? await emailService.loadSavedAttachments(savedAttachments)
+      : await emailService.scanInvoiceInbox({ throwOnError: true });
+    const processed = new Set<string>();
+    const skipped: Array<{ from: string; filename: string; reason: string }> = [];
+    let invoices = 0;
+    let soa = 0;
+
+    for (const attachment of attachments) {
+      const isSoa = attachment.kind === "soa" || isSoaDocument(attachment.filename, attachment.subject);
+
+      if (isSoa) {
+        soa += 1;
+        const run = await this.createRun(
+          WorkflowType.RECONCILIATION,
+          `${attachment.messageId}:${attachment.filename}`
+        );
+        await reconciliationWorkflow.startFromSoaDocument(run.id, attachment);
+      } else {
+        const isWhitelisted = await authorizationService.isWhitelistedEmailDomain(attachment.from);
+        if (!isWhitelisted) {
+          const reason = `Sender ${attachment.from} is not a known supplier email domain`;
+          logger.warn(
+            { from: attachment.from, filename: attachment.filename },
+            "Skipping email invoice — sender domain is not on a supplier"
+          );
+          skipped.push({ from: attachment.from, filename: attachment.filename, reason });
+          continue;
+        }
+
+        const supervisorPhone =
+          (await organizationService.getSupervisorPhone(organizationId)) ?? "+6590000000";
+        const filePath =
+          attachment.savedPath ?? (await saveUploadedFile(attachment.content, attachment.filename));
+        await conversationService.recordInbound(organizationId, {
+          messageId: `${attachment.messageId}:${attachment.filename}`,
+          from: supervisorPhone,
+          timestamp: String(Date.now()),
+          type: attachment.contentType === "application/pdf" ? "document" : "image",
+          filename: attachment.filename,
+          mimeType: attachment.contentType,
+          text: `[email invoice: ${attachment.filename} from ${attachment.from}]`,
+          isGroup: false,
+          organizationId,
+        });
+        const run = await this.createRun(
+          WorkflowType.INVOICE_CAPTURE,
+          `${attachment.messageId}:${attachment.filename}`
+        );
+        await invoiceCaptureWorkflow.processInvoice(
+          run.id,
+          filePath,
+          "EMAIL",
+          attachment.messageId,
+          supervisorPhone,
+          attachment.contentType
+        );
+        invoices += 1;
+      }
+
+      processed.add(attachment.messageId);
+    }
+
+    for (const messageId of processed) {
+      await emailService.markEmailProcessed(messageId);
+    }
+
+    logger.info(
+      { organizationId, attachments: attachments.length, invoices, soa, skipped: skipped.length },
+      "Email inbox scan finished"
+    );
+
+    return { attachments: attachments.length, invoices, soa, skipped };
   }
 
   private async handleApprovalResolved(approvalId: string, response: string): Promise<void> {
@@ -140,7 +267,6 @@ class Orchestrator {
     return run;
   }
 
-  /** Fan-out scheduled jobs across all active organizations. */
   async runScheduledJob(
     jobName: "email.scan" | "payment.monitor",
     enqueue: (name: string, data: Record<string, unknown>) => Promise<void>
