@@ -1,4 +1,4 @@
-import { WorkflowType, WorkflowStatus } from "@prisma/client";
+import { WorkflowType, WorkflowStatus, ApprovalGateType } from "@prisma/client";
 import { prisma } from "../db/client.js";
 import { auditService } from "../services/audit.service.js";
 import { organizationService } from "../services/organization.service.js";
@@ -10,6 +10,7 @@ import { poIntakeWorkflow } from "../workflows/po-intake/index.js";
 import { invoiceCaptureWorkflow } from "../workflows/invoice-capture/index.js";
 import { reconciliationWorkflow } from "../workflows/reconciliation/index.js";
 import { paymentExecutionWorkflow } from "../workflows/payment-execution/index.js";
+import { progressService } from "../services/progress.service.js";
 import { withOrganization } from "../context/tenant.js";
 import { saveUploadedFile } from "../utils/storage.js";
 import { isSoaDocument } from "../utils/matching.js";
@@ -48,19 +49,24 @@ class Orchestrator {
         await this.handleWhatsAppMessage(event.payload);
         break;
       case "email.scan":
-        await withOrganization(event.payload.organizationId, () =>
-          this.runEmailScan(event.payload.attachments)
-        );
+        await withOrganization(event.payload.organizationId, async () => {
+          const phone = (await organizationService.getSupervisorPhone(event.payload.organizationId)) ?? "";
+          await progressService.whileWorking(phone, "the email inbox scan", () =>
+            this.runEmailScan(event.payload.attachments)
+          );
+        });
         break;
       case "invoice.capture":
         await withOrganization(event.payload.organizationId, () =>
-          invoiceCaptureWorkflow.processInvoice(
-            event.payload.workflowRunId,
-            event.payload.filePath,
-            event.payload.source,
-            event.payload.sourceRef,
-            event.payload.notifyPhone,
-            event.payload.mimeType
+          progressService.whileWorking(event.payload.notifyPhone, "this invoice", () =>
+            invoiceCaptureWorkflow.processInvoice(
+              event.payload.workflowRunId,
+              event.payload.filePath,
+              event.payload.source,
+              event.payload.sourceRef,
+              event.payload.notifyPhone,
+              event.payload.mimeType
+            )
           )
         );
         break;
@@ -97,7 +103,22 @@ class Orchestrator {
 
     message.organizationId = organization.id;
 
-    await withOrganization(organization.id, () => this.routeWhatsAppMessage(message), organization.slug);
+    await withOrganization(
+      organization.id,
+      async () => {
+        if (message.isGroup && !message.mentionsBot) {
+          return;
+        }
+        const phone =
+          message.isGroup
+            ? ((await organizationService.getSupervisorPhone(organization.id)) ?? message.from)
+            : message.from;
+        await progressService.whileWorking(phone, describeWhatsAppWork(message), () =>
+          this.routeWhatsAppMessage(message)
+        );
+      },
+      organization.slug
+    );
   }
 
   private async routeWhatsAppMessage(message: WhatsAppInboundMessage): Promise<void> {
@@ -137,7 +158,10 @@ class Orchestrator {
   }
 
   async scanEmailInboxNow(organizationId: string) {
-    return withOrganization(organizationId, () => this.runEmailScan());
+    return withOrganization(organizationId, async () => {
+      const phone = (await organizationService.getSupervisorPhone(organizationId)) ?? "";
+      return progressService.whileWorking(phone, "the email inbox scan", () => this.runEmailScan());
+    });
   }
 
   private async runEmailScan(savedAttachments?: SavedEmailAttachment[]): Promise<{
@@ -150,7 +174,7 @@ class Orchestrator {
     const attachments = savedAttachments?.length
       ? await emailService.loadSavedAttachments(savedAttachments)
       : await emailService.scanInvoiceInbox({ throwOnError: true });
-    const processed = new Set<string>();
+    const processed = new Map<string, number | undefined>();
     const skipped: Array<{ from: string; filename: string; reason: string }> = [];
     let invoices = 0;
     let soa = 0;
@@ -207,11 +231,11 @@ class Orchestrator {
         invoices += 1;
       }
 
-      processed.add(attachment.messageId);
+      processed.set(attachment.messageId, attachment.uid);
     }
 
-    for (const messageId of processed) {
-      await emailService.markEmailProcessed(messageId);
+    for (const [messageId, uid] of processed) {
+      await emailService.markEmailProcessed(messageId, uid);
     }
 
     logger.info(
@@ -230,21 +254,27 @@ class Orchestrator {
     if (!approval?.workflowRun) return;
 
     const { workflowRun } = approval;
-
-    switch (workflowRun.type) {
-      case WorkflowType.PO_INTAKE:
-        await poIntakeWorkflow.onApprovalResolved(workflowRun.id, approval.gateType, response);
-        break;
-      case WorkflowType.INVOICE_CAPTURE:
-        await invoiceCaptureWorkflow.onApprovalResolved(workflowRun.id, approval.gateType, response);
-        break;
-      case WorkflowType.RECONCILIATION:
-        await reconciliationWorkflow.onApprovalResolved(workflowRun.id, approval.gateType, response);
-        break;
-      case WorkflowType.PAYMENT_EXECUTION:
-        await paymentExecutionWorkflow.onApprovalResolved(workflowRun.id, approval.gateType, response);
-        break;
-    }
+    const phone = (await organizationService.getSupervisorPhone(workflowRun.organizationId)) ?? "";
+    await progressService.whileWorking(
+      phone,
+      describeApprovalWork(workflowRun.type, approval.gateType, response),
+      async () => {
+        switch (workflowRun.type) {
+          case WorkflowType.PO_INTAKE:
+            await poIntakeWorkflow.onApprovalResolved(workflowRun.id, approval.gateType, response);
+            break;
+          case WorkflowType.INVOICE_CAPTURE:
+            await invoiceCaptureWorkflow.onApprovalResolved(workflowRun.id, approval.gateType, response);
+            break;
+          case WorkflowType.RECONCILIATION:
+            await reconciliationWorkflow.onApprovalResolved(workflowRun.id, approval.gateType, response);
+            break;
+          case WorkflowType.PAYMENT_EXECUTION:
+            await paymentExecutionWorkflow.onApprovalResolved(workflowRun.id, approval.gateType, response);
+            break;
+        }
+      }
+    );
   }
 
   private async createRun(type: WorkflowType, triggerRef: string) {
@@ -283,3 +313,25 @@ class Orchestrator {
 }
 
 export const orchestrator = new Orchestrator();
+
+function describeWhatsAppWork(message: WhatsAppInboundMessage): string {
+  const text = message.text?.toLowerCase() ?? "";
+  if (message.type === "image" || message.type === "document") return "this invoice";
+  if (text.includes("reconcile") || text.includes("statement") || text.includes("payment")) {
+    return "reconciliation";
+  }
+  if (text.includes("remove") || text.includes("modify") || text.includes("change") || text.includes("add")) {
+    return "this order change";
+  }
+  return "your request";
+}
+
+function describeApprovalWork(type: WorkflowType, gateType: ApprovalGateType, response: string): string {
+  if (gateType === ApprovalGateType.DBS_STANDBY || response.toLowerCase() === "ready") {
+    return "the DBS payment";
+  }
+  if (type === WorkflowType.RECONCILIATION) return "reconciliation";
+  if (type === WorkflowType.INVOICE_CAPTURE) return "this invoice";
+  if (type === WorkflowType.PO_INTAKE) return "this order";
+  return "your reply";
+}

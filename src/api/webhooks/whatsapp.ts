@@ -6,6 +6,14 @@ import { enqueueJob } from "../../jobs/queue.js";
 import { approvalService } from "../../services/approval.service.js";
 import { organizationService } from "../../services/organization.service.js";
 import { conversationService } from "../../services/conversation.service.js";
+import { whatsappService } from "../../services/whatsapp.service.js";
+import { withOrganization } from "../../context/tenant.js";
+import { BOT_HELP_GUIDE } from "../../prompts/system.js";
+import {
+  isRestartCommand,
+  looksLikeNewPurchaseOrder,
+  looksLikeReconcileRequest,
+} from "../../utils/matching.js";
 import type { WhatsAppInboundMessage } from "../../types/index.js";
 
 interface RawWhatsAppMessage {
@@ -162,27 +170,71 @@ export async function processWhatsAppWebhook(
 
         await conversationService.recordInbound(organization.id, inbound);
 
-        if (inbound.text) {
-          const response = inbound.text.trim();
-          const pendingApproval = await approvalService.findPendingForOrganization(
-            organization.id
-          );
+        const result = await withOrganization(
+          organization.id,
+          async () => {
+            if (inbound.text) {
+              const response = inbound.text.trim();
+              const pendingApproval = await approvalService.findPendingForOrganization(
+                organization.id
+              );
 
-          if (pendingApproval) {
-            await approvalService.resolve(pendingApproval.id, response, inbound.from);
-            await enqueueJob("approval.resolved", {
-              approvalId: pendingApproval.id,
-              response,
+              if (pendingApproval && !inbound.isGroup) {
+                if (isRestartCommand(response)) {
+                  await approvalService.abandonPending(pendingApproval, "supervisor restarted");
+                  await whatsappService.sendText(
+                    inbound.from,
+                    "Cancelled the previous request. Send a new order, invoice, or reconcile message.\n\n" +
+                      BOT_HELP_GUIDE
+                  );
+                  return { status: "restarted" as const, messageId: inbound.messageId };
+                }
+
+                if (looksLikeNewPurchaseOrder(response) || looksLikeReconcileRequest(response)) {
+                  await approvalService.abandonPending(pendingApproval, "supervisor changed topic");
+                  await whatsappService.sendText(
+                    inbound.from,
+                    "That doesn't match the question I asked, so I cancelled the previous step and will start from this message. Reply *restart* any time to do this on purpose."
+                  );
+                  await enqueueJob("whatsapp.message", {
+                    ...inbound,
+                    organizationId: organization.id,
+                  });
+                  return { status: "restarted_new_intent" as const, messageId: inbound.messageId };
+                }
+
+                await approvalService.resolve(pendingApproval.id, response, inbound.from);
+                await enqueueJob("approval.resolved", {
+                  approvalId: pendingApproval.id,
+                  response,
+                  organizationId: organization.id,
+                });
+                return { status: "approval_processed" as const, messageId: inbound.messageId };
+              }
+
+              if (pendingApproval) {
+                await approvalService.resolve(pendingApproval.id, response, inbound.from);
+                await enqueueJob("approval.resolved", {
+                  approvalId: pendingApproval.id,
+                  response,
+                  organizationId: organization.id,
+                });
+                return { status: "approval_processed" as const, messageId: inbound.messageId };
+              }
+            }
+
+            await enqueueJob("whatsapp.message", {
+              ...inbound,
               organizationId: organization.id,
             });
-            return { status: "approval_processed", messageId: inbound.messageId };
-          }
-        }
+            return { status: "ok" as const, messageId: inbound.messageId };
+          },
+          organization.slug
+        );
 
-        await enqueueJob("whatsapp.message", {
-          ...inbound,
-          organizationId: organization.id,
-        });
+        if (result.status !== "ok") {
+          return result;
+        }
       }
     }
   }

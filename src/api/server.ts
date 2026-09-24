@@ -52,7 +52,8 @@ export async function createServer() {
   });
 
   app.get("/admin/*", async (request, reply) => {
-    const relPath = request.url.replace(/^\/admin\/?/, "") || "index.html";
+    const pathname = request.url.split("?")[0] ?? request.url;
+    const relPath = pathname.replace(/^\/admin\/?/, "") || "index.html";
     const safePath = path.normalize(relPath).replace(/^(\.\.(\/|\\|$))+/, "");
     const filePath = path.join(ADMIN_ROOT, safePath);
 

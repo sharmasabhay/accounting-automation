@@ -35,6 +35,21 @@ class AuthorizationService {
     return Boolean(supplier);
   }
 
+  async listSupplierEmailDomains(organizationId?: string): Promise<string[]> {
+    const orgId = organizationId ?? getOrganizationId();
+    const suppliers = await prisma.supplier.findMany({
+      where: { organizationId: orgId, isActive: true, emailDomain: { not: null } },
+      select: { emailDomain: true },
+    });
+    return [
+      ...new Set(
+        suppliers
+          .map((row) => row.emailDomain?.replace(/^@/, "").trim().toLowerCase())
+          .filter((domain): domain is string => Boolean(domain))
+      ),
+    ];
+  }
+
   async getSupplierByEmailDomain(email: string, organizationId?: string) {
     const orgId = organizationId ?? getOrganizationId();
     const domain = email.split("@")[1]?.toLowerCase();

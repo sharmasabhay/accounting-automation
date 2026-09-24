@@ -48,7 +48,9 @@ Message something like:
 Please reconcile payment for Fresh Farms
 
 *4. Approvals*
-When I ask a question, reply *yes*, *no*, or *ready* as prompted.
+When I ask a question, reply as prompted (*yes*, *no*, *ready*, a price, a supplier name, etc.).
+Reply *restart* at any time to cancel that step and start over.
+If I picked a supplier from a previous order, reply *change supplier* to choose another.
 
 Need help again? Reply *help*.`;
 

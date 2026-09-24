@@ -26,6 +26,7 @@ import {
 } from "../../utils/matching.js";
 import { logDone, logStep } from "../../utils/workflow-log.js";
 import { notifySupervisorOfXeroError } from "../../utils/xero-error.js";
+import { listInFlightBillIds } from "../../utils/payment-batch.js";
 
 interface ReconciliationPayload {
   supplierId: string;
@@ -35,7 +36,8 @@ interface ReconciliationPayload {
   periodLabel: string;
   soaFilePath?: string;
   soaExtraction?: SoaExtraction;
-  sourceChoice?: "xero" | "request-soa";
+  sourceChoice?: "xero" | "email" | "request-soa";
+  imapSearched?: boolean;
   priorScope?: "full" | "current" | "custom";
   customAmount?: number;
   comparison?: SoaCompareResult;
@@ -64,7 +66,7 @@ export const reconciliationWorkflow = {
     if (!supplier) {
       await whatsappService.sendText(
         message.from,
-        "Which supplier should I reconcile? Please include the supplier name."
+        "Which supplier should I reconcile? Include the name, for example:\nPlease reconcile payment for Fresh Farms"
       );
       await this.finish(workflowRunId, WorkflowStatus.CANCELLED);
       return;
@@ -90,7 +92,7 @@ export const reconciliationWorkflow = {
     if (!supplier) {
       await whatsappService.sendText(
         supervisorPhone,
-        "Could not infer supplier from group. Please reconcile via DM with supplier name."
+        `A group asked me to reconcile, but I couldn't tell which supplier that chat belongs to. Please DM me with the supplier name, for example:\nPlease reconcile payment for Fresh Farms`
       );
       await this.finish(workflowRunId, WorkflowStatus.CANCELLED);
       return;
@@ -121,7 +123,7 @@ export const reconciliationWorkflow = {
     if (!supplier) {
       await whatsappService.sendText(
         supervisorPhone,
-        `New SOA arrived from ${attachment.from} (${attachment.filename}) but I could not match a supplier.`
+        `A new statement of account arrived from ${attachment.from} (${attachment.filename}), but I couldn't match it to a supplier. Please add or check that supplier's email domain, then ask me to reconcile.`
       );
       await this.finish(workflowRunId, WorkflowStatus.CANCELLED);
       return;
@@ -141,7 +143,7 @@ export const reconciliationWorkflow = {
     await approvalService.create({
       workflowRunId,
       gateType: ApprovalGateType.NEW_SOA_DETECTION,
-      question: `A new SOA arrived for ${supplier.name} (${attachment.filename}). Reconcile it now for ${period.label}?`,
+      question: `A new statement of account arrived for *${supplier.name}* (${attachment.filename}). Reconcile ${period.label} now?`,
       options: ["yes", "no"],
     });
     await prisma.workflowRun.update({
@@ -170,12 +172,12 @@ export const reconciliationWorkflow = {
   ): Promise<void> {
     const question = [
       extra,
-      `Which period should I reconcile for ${supplierName}?`,
+      `Which period should I reconcile for *${supplierName}*?`,
       "",
-      "Reply with one of these formats:",
-      "• Month: September 2026",
-      "• Date range: 01/09/2026 - 30/09/2026",
-      "• All: all",
+      "You can reply with:",
+      "• a month — September 2026",
+      "• a date range — 01/09/2026 - 30/09/2026",
+      "• *all* unpaid bills",
     ]
       .filter(Boolean)
       .join("\n");
@@ -200,9 +202,37 @@ export const reconciliationWorkflow = {
       periodEnd: period.end.toISOString(),
       periodLabel: period.label,
     };
-    await this.savePayload(workflowRunId, payload, "3.1-search-soa", WorkflowStatus.IN_PROGRESS);
+    await this.savePayload(workflowRunId, payload, "3.1-source", WorkflowStatus.AWAITING_APPROVAL);
     logStep(workflowRunId, "Reconciliation started", `${period.label} · supplier ${supplierId}`);
-    await this.searchAndContinue(workflowRunId);
+    if (payload.soaFilePath) {
+      await this.searchAndContinue(workflowRunId);
+      return;
+    }
+    await this.askSourceChoice(workflowRunId, payload);
+  },
+
+  async askSourceChoice(workflowRunId: string, payload: ReconciliationPayload): Promise<void> {
+    const supplier = await prisma.supplier.findUniqueOrThrow({ where: { id: payload.supplierId } });
+    const afterImapMiss = Boolean(payload.imapSearched);
+    await this.savePayload(workflowRunId, payload, "3.2-source-choice", WorkflowStatus.AWAITING_APPROVAL);
+    await approvalService.create({
+      workflowRunId,
+      gateType: ApprovalGateType.RECONCILIATION_SOURCE_CHOICE,
+      question: afterImapMiss
+        ? [
+            `I couldn't find a statement of account for *${supplier.name}* in the invoice inbox (${payload.periodLabel}).`,
+            "",
+            "*xero* — continue with unpaid Xero bills only",
+            "*request soa* — ask the supplier to send a statement",
+          ].join("\n")
+        : [
+            `How should I reconcile *${supplier.name}* for *${payload.periodLabel}*?`,
+            "",
+            "*xero* — unpaid bills in Xero only (usually a few seconds)",
+            "*email* — look for their statement in the invoice inbox, then compare it to Xero (can take a minute)",
+          ].join("\n"),
+      options: afterImapMiss ? ["xero", "request soa"] : ["xero", "email"],
+    });
   },
 
   async searchAndContinue(workflowRunId: string): Promise<void> {
@@ -214,12 +244,19 @@ export const reconciliationWorkflow = {
     }
     const supplier = await prisma.supplier.findUniqueOrThrow({ where: { id: payload.supplierId } });
 
-    if (!payload.soaFilePath) {
-      const emails = await emailService.scanInvoiceInbox();
+    if (!payload.soaFilePath && payload.sourceChoice === "email" && !payload.imapSearched) {
+      payload.imapSearched = true;
+      await this.savePayload(workflowRunId, payload, "3.2-imap", WorkflowStatus.IN_PROGRESS);
+      await whatsappService.sendText(
+        payload.notifyPhone,
+        `Looking in the invoice inbox for a statement from *${supplier.name}*…`
+      );
+      const emails = await emailService.scanInvoiceInbox({ soaOnly: true });
+      const domain = (supplier.emailDomain ?? "").toLowerCase();
       const soa = emails.find(
         (item) =>
           item.kind === "soa" &&
-          (item.from.toLowerCase().includes((supplier.emailDomain ?? "").toLowerCase()) ||
+          ((domain && item.from.toLowerCase().includes(domain)) ||
             item.subject.toLowerCase().includes(supplier.name.toLowerCase()))
       );
       if (soa) {
@@ -228,13 +265,7 @@ export const reconciliationWorkflow = {
     }
 
     if (!payload.soaFilePath && payload.sourceChoice !== "xero") {
-      await this.savePayload(workflowRunId, payload, "3.2-source-choice", WorkflowStatus.AWAITING_APPROVAL);
-      await approvalService.create({
-        workflowRunId,
-        gateType: ApprovalGateType.RECONCILIATION_SOURCE_CHOICE,
-        question: `No SOA found for ${supplier.name} (${payload.periodLabel}). Reconcile using Xero only, or request an SOA from the supplier?`,
-        options: ["xero", "request soa"],
-      });
+      await this.askSourceChoice(workflowRunId, payload);
       return;
     }
 
@@ -252,6 +283,14 @@ export const reconciliationWorkflow = {
           balanceDue: extracted.extraction.total.value,
         };
       }
+    }
+
+    if (payload.sourceChoice === "xero" && !payload.soaFilePath) {
+      logStep(workflowRunId, "Xero-only reconcile — skipping inbox", supplier.name);
+      await whatsappService.sendText(
+        payload.notifyPhone,
+        `Checking unpaid Xero bills for *${supplier.name}*…`
+      );
     }
 
     await this.compareAndContinue(workflowRunId, payload);
@@ -272,24 +311,31 @@ export const reconciliationWorkflow = {
     const start = new Date(payload.periodStart);
     const end = new Date(payload.periodEnd);
 
-    const xeroBills = await xeroService.getBillsForPeriod(
+    const { unpaid: fetchedUnpaid, paid: paidXeroBills } = await xeroService.getReconciliationBillsForPeriod(
       organizationId,
       supplier.xeroContactId ?? supplier.id,
       start,
       end
     );
-    const older = await prisma.xeroBill.findMany({
+    const inFlightIds = await listInFlightBillIds(supplier.id);
+    const xeroBills = fetchedUnpaid.filter((bill) => !inFlightIds.has(bill.xeroBillId));
+    const older = (await prisma.xeroBill.findMany({
       where: {
         supplierId: supplier.id,
         status: { in: ["SUBMITTED", "AWAITING_PAYMENT"] },
         invoiceDate: { lt: start },
       },
-    });
+    })).filter((bill) => !inFlightIds.has(bill.xeroBillId ?? bill.id));
 
     const comparison = payload.soaExtraction
       ? compareSoaToXero(
           payload.soaExtraction.invoices,
           xeroBills.map((bill) => ({
+            invoiceNumber: bill.invoiceNumber,
+            amount: bill.total,
+            xeroBillId: bill.xeroBillId,
+          })),
+          paidXeroBills.map((bill) => ({
             invoiceNumber: bill.invoiceNumber,
             amount: bill.total,
             xeroBillId: bill.xeroBillId,
@@ -302,6 +348,7 @@ export const reconciliationWorkflow = {
             xeroBillId: bill.xeroBillId,
           })),
           missingFromXero: [],
+          alreadyPaid: [],
           amountMismatch: [],
           xeroAbsentFromSoa: [],
         };
@@ -314,12 +361,13 @@ export const reconciliationWorkflow = {
         workflowRunId,
         gateType: ApprovalGateType.MISMATCH_RESOLUTION,
         question: [
-          `Amount mismatches for ${supplier.name}:`,
+          `Amount differences for *${supplier.name}*:`,
           ...comparison.amountMismatch.map(
             (row) =>
-              `- ${row.invoiceNumber}: SOA S$${row.soaAmount.toFixed(2)} vs Xero S$${row.xeroAmount.toFixed(2)}`
+              `• ${row.invoiceNumber}: SOA S$${row.soaAmount.toFixed(2)} vs Xero S$${row.xeroAmount.toFixed(2)}`
           ),
-          "Reply *yes* to continue with Xero amounts, or describe the correction.",
+          "",
+          "Reply *yes* to continue with the Xero amounts, or tell me what to correct.",
         ].join("\n"),
       });
       return;
@@ -330,9 +378,9 @@ export const reconciliationWorkflow = {
       await approvalService.create({
         workflowRunId,
         gateType: ApprovalGateType.PRIOR_BALANCE_SCOPE,
-        question: `${supplier.name} has ${older.length} older unpaid bill(s) totaling S$${older
+        question: `*${supplier.name}* also has ${older.length} older unpaid bill(s) totaling S$${older
           .reduce((sum, bill) => sum + Number(bill.totalAmount ?? 0), 0)
-          .toFixed(2)}. Pay *full* outstanding, *current* month only, or a custom amount?`,
+          .toFixed(2)}.\n\nPay the *full* outstanding, *current* period only, or a *custom* amount?`,
         options: ["full", "current", "custom"],
       });
       return;
@@ -348,9 +396,9 @@ export const reconciliationWorkflow = {
       const recon = await this.persistRun(payload, "AWAITING_MISSING_INVOICES");
       await whatsappService.sendText(
         payload.notifyPhone,
-        `Asked ${supplier.name} for missing invoice(s): ${comparison.missingFromXero
+        `I asked *${supplier.name}* for invoice(s) ${comparison.missingFromXero
           .map((row) => row.invoiceNumber)
-          .join(", ")}. I will wait for the file and confirm goods received before creating bills.`
+          .join(", ")}. I'll wait for the file, then confirm with you that the goods were received before creating bills.`
       );
       await this.finish(workflowRunId, WorkflowStatus.COMPLETED, { reconciliationId: recon.id });
       return;
@@ -404,24 +452,37 @@ export const reconciliationWorkflow = {
       soaTotal,
       xeroTotal,
       matched: comparison.matched.length,
+      alreadyPaid: comparison.alreadyPaid.map((row) => row.invoiceNumber),
       missingFromXero: comparison.missingFromXero.map((row) => row.invoiceNumber),
       amountMismatch: comparison.amountMismatch,
       xeroAbsentFromSoa: comparison.xeroAbsentFromSoa,
     });
 
+    const none = "none";
+    const paid = comparison.alreadyPaid.map((row) => row.invoiceNumber).join(", ") || none;
+    const missing = comparison.missingFromXero.map((row) => row.invoiceNumber).join(", ") || none;
+    const absent = comparison.xeroAbsentFromSoa.map((row) => row.invoiceNumber).join(", ") || none;
     const summary = [
-      `Reconciliation: ${supplier.name} — ${payload.periodLabel}`,
+      `*Reconciliation — ${supplier.name}*`,
+      `Period: ${payload.periodLabel}`,
       "",
-      `SOA total: S$${soaTotal.toFixed(2)}`,
-      `Xero total: S$${xeroTotal.toFixed(2)}`,
-      `Matched: ${comparison.matched.length}`,
-      `Missing from Xero: ${comparison.missingFromXero.map((row) => row.invoiceNumber).join(", ") || "none"}`,
-      `Amount mismatches: ${comparison.amountMismatch.length}`,
-      `Xero bills absent from SOA: ${comparison.xeroAbsentFromSoa.map((row) => row.invoiceNumber).join(", ") || "none"}`,
+      `Statement total: S$${soaTotal.toFixed(2)}`,
+      `Xero unpaid: S$${xeroTotal.toFixed(2)}`,
+      `Matched unpaid: ${comparison.matched.length}`,
+      `Already paid (not included): ${paid}`,
+      `Missing from Xero: ${missing}`,
+      `Amount differences: ${comparison.amountMismatch.length || none}`,
+      `In Xero but not on the statement: ${absent}`,
       "",
-      "Payable list:",
-      ...payableList.items.map((item) => `- ${item.invoiceNumber} S$${item.amount.toFixed(2)}`),
-      `Total: S$${payableList.totalAmount.toFixed(2)}`,
+      "*To pay*",
+      ...(payableList.items.length
+        ? payableList.items.map((item) => `• ${item.invoiceNumber}  S$${item.amount.toFixed(2)}`)
+        : ["• Nothing to pay"]),
+      `*Total: S$${payableList.totalAmount.toFixed(2)}*`,
+      "",
+      payableList.items.length
+        ? "I'll prepare this payment in DBS next."
+        : "No DBS payment needed.",
     ].join("\n");
 
     await whatsappService.sendText(payload.notifyPhone, summary);
@@ -439,6 +500,9 @@ export const reconciliationWorkflow = {
       outputs: { reconciliationId: recon.id, payableList },
       outcome: "success",
     });
+    if (payableList.items.length === 0) {
+      return;
+    }
     await enqueueJob("reconciliation.payable.ready", {
       reconciliationRunId: recon.id,
       organizationId: getOrganizationId(),
@@ -492,7 +556,7 @@ export const reconciliationWorkflow = {
         await this.createPeriodApproval(
           workflowRunId,
           supplier.name,
-          "I could not read that period. Please use the format below."
+          "I couldn't read that period. Please use one of the formats below."
         );
         return;
       }
@@ -517,17 +581,27 @@ export const reconciliationWorkflow = {
         if (supplier.whatsappGroupId) {
           await whatsappService.sendGroupText(
             supplier.whatsappGroupId,
-            `Please send the statement of account for ${payload.periodLabel}.`
+            `Please send the statement of account for ${payload.periodLabel}. Thank you.`
           );
         }
         await whatsappService.sendText(
           payload.notifyPhone,
-          `Asked ${supplier.name} for an SOA. I will continue when it arrives.`
+          `Asked *${supplier.name}* for the statement of account. I'll continue when it arrives.`
         );
         await this.finish(workflowRunId, WorkflowStatus.COMPLETED);
         return;
       }
-      payload.sourceChoice = "xero";
+      if (
+        lower.includes("email") ||
+        lower.includes("imap") ||
+        lower.includes("inbox") ||
+        lower.includes("both") ||
+        lower === "soa"
+      ) {
+        payload.sourceChoice = "email";
+      } else {
+        payload.sourceChoice = "xero";
+      }
       await this.savePayload(workflowRunId, payload);
       await this.searchAndContinue(workflowRunId);
       return;

@@ -19,21 +19,25 @@ class PoResolutionService {
       where: { organizationId, isActive: true },
       orderBy: { createdAt: "asc" },
     });
-    if (suppliers.length === 0) return { supplier: null, ambiguous: false as const };
+    if (suppliers.length === 0) return { supplier: null, ambiguous: false as const, inferredFromHistory: false as const };
 
     const mentioned =
       options.mentionedName ??
       options.items.map((item) => item.supplier).find((name) => Boolean(name));
     if (mentioned) {
       const exact = suppliers.find((s) => namesMatch(s.name, mentioned));
-      if (exact) return { supplier: exact, ambiguous: false as const };
+      if (exact) return { supplier: exact, ambiguous: false as const, inferredFromHistory: false as const };
       const partial = suppliers.filter(
         (s) =>
           s.name.toLowerCase().includes(mentioned.toLowerCase()) ||
           mentioned.toLowerCase().includes(s.name.toLowerCase())
       );
-      if (partial.length === 1) return { supplier: partial[0]!, ambiguous: false as const };
-      if (partial.length > 1) return { supplier: null, ambiguous: true as const };
+      if (partial.length === 1) {
+        return { supplier: partial[0]!, ambiguous: false as const, inferredFromHistory: false as const };
+      }
+      if (partial.length > 1) {
+        return { supplier: null, ambiguous: true as const, inferredFromHistory: false as const };
+      }
     }
 
     const votes = new Map<string, number>();
@@ -53,17 +57,17 @@ class PoResolutionService {
     if (votes.size === 1) {
       const supplierId = [...votes.keys()][0]!;
       const supplier = suppliers.find((s) => s.id === supplierId) ?? null;
-      return { supplier, ambiguous: false as const };
+      return { supplier, ambiguous: false as const, inferredFromHistory: true as const };
     }
     if (votes.size > 1) {
-      return { supplier: null, ambiguous: true as const };
+      return { supplier: null, ambiguous: true as const, inferredFromHistory: false as const };
     }
 
     if (suppliers.length === 1) {
-      return { supplier: suppliers[0]!, ambiguous: false as const };
+      return { supplier: suppliers[0]!, ambiguous: false as const, inferredFromHistory: false as const };
     }
 
-    return { supplier: null, ambiguous: true as const };
+    return { supplier: null, ambiguous: true as const, inferredFromHistory: false as const };
   }
 
   async lastPrice(supplierId: string, itemName: string): Promise<number | null> {
@@ -87,14 +91,23 @@ class PoResolutionService {
     for (const item of items) {
       const sku = await skuMappingService.resolveItem(organizationId, supplierId, item.itemName);
       const historyPrice = await this.lastPrice(supplierId, item.itemName);
+      const xeroPrice = sku.item?.purchaseUnitPrice;
+      const unitPrice = historyPrice ?? xeroPrice ?? item.unitPrice;
       resolved.push({
         ...item,
         xeroItemId: sku.item?.itemId ?? item.xeroItemId,
         xeroItemCode: sku.item?.code ?? item.xeroItemCode,
-        unitPrice: historyPrice ?? item.unitPrice,
-        priceSource: historyPrice != null ? "history" : item.unitPrice != null ? "confirmed" : "unknown",
+        unitPrice,
+        priceSource:
+          historyPrice != null
+            ? "history"
+            : xeroPrice != null
+              ? "xero"
+              : item.unitPrice != null
+                ? "confirmed"
+                : "unknown",
         needsSkuConfirmation: sku.needsConfirmation || sku.ambiguous,
-        needsPriceConfirmation: historyPrice == null && item.unitPrice == null,
+        needsPriceConfirmation: unitPrice == null,
       });
     }
     return resolved;

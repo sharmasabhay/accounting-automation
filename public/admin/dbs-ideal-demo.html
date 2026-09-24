@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IDEAL demo (not real DBS)</title>
+  <style>
+    :root {
+      --red: #c8102e;
+      --navy: #0b1f3a;
+      --bg: #f3f5f8;
+      --card: #fff;
+      --muted: #5b6b7c;
+      --line: #d7dee8;
+      --ok: #0f7b4c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--navy);
+    }
+    header {
+      background: var(--navy);
+      color: #fff;
+      padding: 0.9rem 1.5rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    header strong { color: #ffd54f; }
+    .banner {
+      background: #fff3cd;
+      color: #664d03;
+      padding: 0.55rem 1.5rem;
+      font-size: 0.9rem;
+      border-bottom: 1px solid #ffe08a;
+    }
+    main { max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 1.5rem;
+    }
+    h1 { font-size: 1.25rem; margin: 0 0 0.35rem; }
+    p { color: var(--muted); }
+    label { display: block; font-size: 0.85rem; margin: 0.9rem 0 0.3rem; }
+    input, select {
+      width: 100%;
+      padding: 0.55rem 0.7rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font-size: 1rem;
+    }
+    button, .purpose {
+      margin-top: 1rem;
+      background: var(--red);
+      color: #fff;
+      border: 0;
+      border-radius: 6px;
+      padding: 0.65rem 1.1rem;
+      font-size: 1rem;
+      cursor: pointer;
+    }
+    .purpose {
+      display: inline-block;
+      background: #e8eef5;
+      color: var(--navy);
+      margin-right: 0.5rem;
+    }
+    .purpose.selected { background: var(--navy); color: #fff; }
+    .hidden { display: none !important; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 0.5rem 0; border-bottom: 1px solid var(--line); }
+    .ok { color: var(--ok); font-size: 1.4rem; letter-spacing: 0.04em; }
+    .push {
+      text-align: center;
+      padding: 2.5rem 1rem;
+    }
+    .dot {
+      width: 14px; height: 14px; border-radius: 50%;
+      background: var(--red);
+      margin: 1rem auto;
+      animation: pulse 1s infinite;
+    }
+    @keyframes pulse {
+      0% { transform: scale(1); opacity: 1; }
+      70% { transform: scale(1.6); opacity: 0.3; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>IDEAL <strong>demo</strong></div>
+    <div id="session-label">Not signed in</div>
+  </header>
+  <div class="banner">Practice bank only. No money moves. Playwright drives this page the same way it will later drive real DBS IDEAL.</div>
+
+  <main>
+    <section id="login" class="card">
+      <h1>Sign in</h1>
+      <p>Organisation ID, User ID, then password. Real DBS then pushes a slide-to-approve to the supervisor phone.</p>
+      <form id="login-form">
+        <label for="orgId">Organisation ID</label>
+        <input id="orgId" name="orgId" autocomplete="off" />
+        <label for="userId">User ID</label>
+        <input id="userId" name="userId" autocomplete="off" />
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" />
+        <button type="submit">Log in</button>
+      </form>
+    </section>
+
+    <section id="push" class="card push hidden">
+      <h1>Waiting for mobile approval</h1>
+      <div class="dot"></div>
+      <p>A push was sent to the supervisor DBS app. Slide to approve on the phone, then this session continues.</p>
+    </section>
+
+    <section id="workspace" class="card hidden">
+      <h1>Pay &amp; Transfer — Pay Local Payee</h1>
+      <p>Saved payees only. The bot must not create a new payee.</p>
+
+      <h2 style="font-size:1rem;margin:1.25rem 0 .5rem">Transaction History</h2>
+      <table>
+        <thead><tr><th>Ref</th><th>Payee</th><th>Amount</th><th>Status</th></tr></thead>
+        <tbody id="history-body"></tbody>
+      </table>
+      <p id="history-empty" class="hidden">No previous payments in this demo session.</p>
+
+      <form id="pay-form" style="margin-top:1.5rem">
+        <label for="payee">Payee</label>
+        <select id="payee" name="payee"></select>
+        <label for="amount">Amount (SGD)</label>
+        <input id="amount" name="amount" />
+        <label>Purpose</label>
+        <button type="button" class="purpose" id="purpose-biz">Business Expenses</button>
+        <input type="hidden" id="purpose" name="purpose" value="" />
+        <label for="reference">Reference</label>
+        <input id="reference" name="reference" />
+        <button type="submit" id="submit-pay">Submit</button>
+      </form>
+    </section>
+
+    <section id="confirm" class="card hidden">
+      <h1>Payment raised</h1>
+      <p>Submitted for an independent DBS approver. Bills should stay Awaiting Payment until that person approves.</p>
+      <p>Transaction reference</p>
+      <div id="txnRef" class="ok"></div>
+    </section>
+  </main>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const savedPayee = params.get("payee") || "DEMO PAYEE";
+    const historyKey = "omakase-dbs-demo-history";
+
+    function show(id) {
+      for (const section of document.querySelectorAll("main > section")) {
+        section.classList.toggle("hidden", section.id !== id);
+      }
+    }
+
+    function loadHistory() {
+      try {
+        return JSON.parse(localStorage.getItem(historyKey) || "[]");
+      } catch {
+        return [];
+      }
+    }
+
+    function renderHistory() {
+      const rows = loadHistory();
+      const body = document.getElementById("history-body");
+      const empty = document.getElementById("history-empty");
+      body.innerHTML = rows
+        .map(
+          (row) =>
+            `<tr><td>${row.ref}</td><td>${row.payee}</td><td>S$${row.amount}</td><td>${row.status}</td></tr>`
+        )
+        .join("");
+      empty.classList.toggle("hidden", rows.length > 0);
+    }
+
+    const payeeSelect = document.getElementById("payee");
+    const opt = document.createElement("option");
+    opt.value = savedPayee;
+    opt.textContent = savedPayee;
+    payeeSelect.replaceChildren(opt);
+
+    document.getElementById("login-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      document.getElementById("session-label").textContent =
+        document.getElementById("orgId").value + " / " + document.getElementById("userId").value;
+      show("push");
+      setTimeout(() => {
+        renderHistory();
+        show("workspace");
+      }, 2200);
+    });
+
+    document.getElementById("purpose-biz").addEventListener("click", () => {
+      document.getElementById("purpose").value = "Business Expenses";
+      document.getElementById("purpose-biz").classList.add("selected");
+    });
+
+    document.getElementById("pay-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const ref = "DEMO-DBS-" + Date.now();
+      const row = {
+        ref,
+        payee: document.getElementById("payee").value,
+        amount: document.getElementById("amount").value,
+        reference: document.getElementById("reference").value,
+        status: "Awaiting bank approval",
+      };
+      const rows = loadHistory();
+      rows.unshift(row);
+      localStorage.setItem(historyKey, JSON.stringify(rows));
+      document.getElementById("txnRef").textContent = ref;
+      show("confirm");
+    });
+  </script>
+</body>
+</html>

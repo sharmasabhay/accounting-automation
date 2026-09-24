@@ -51,6 +51,9 @@ export function describeXeroFailure(error: unknown): { human: string; technical:
   } else if (lower.includes("contact")) {
     human =
       "Xero could not find or use this supplier's contact. Check the Xero Contact ID on the supplier in Admin.";
+  } else if (lower.includes("account could not be found") || lower.includes("accountcode")) {
+    human =
+      "Xero could not find the account used for this document. The app will look up your chart of accounts; if this persists, reconnect Xero in Admin → Integrations.";
   } else if (lower.includes("validation") || lower.includes("did not return")) {
     human =
       "Xero rejected the document because some fields are invalid. Check the details below and correct the order or invoice.";

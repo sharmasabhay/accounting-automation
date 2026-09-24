@@ -3,8 +3,31 @@ import { ImapFlow } from "imapflow";
 import { logger } from "../utils/logger.js";
 import { getOrganizationId } from "../context/tenant.js";
 import { integrationConfigService } from "./integration-config.service.js";
+import { authorizationService } from "./authorization.service.js";
 import { isSoaDocument } from "../utils/matching.js";
 import type { SavedEmailAttachment } from "../types/index.js";
+
+/** Unread messages processed per IMAP scan. Remainder stay unread for the next run. */
+export const IMAP_UNREAD_BATCH = 25;
+
+const PUBLIC_MAILBOX_DOMAINS = new Set([
+  "gmail.com",
+  "googlemail.com",
+  "yahoo.com",
+  "hotmail.com",
+  "outlook.com",
+  "live.com",
+  "msn.com",
+  "icloud.com",
+  "me.com",
+  "aol.com",
+]);
+
+const IMAP_TIMEOUTS = {
+  connectionTimeout: 15_000,
+  greetingTimeout: 15_000,
+  socketTimeout: 20_000,
+};
 
 export interface EmailAttachment {
   filename: string;
@@ -15,6 +38,60 @@ export interface EmailAttachment {
   messageId: string;
   kind: "invoice" | "soa";
   savedPath?: string;
+  uid?: number;
+}
+
+function senderMatchesSupplierDomain(from: string, domains: string[]): boolean {
+  const domain = from.split("@")[1]?.trim().toLowerCase();
+  return Boolean(domain && domains.includes(domain));
+}
+
+function unreadFromSupplierSearch(
+  domains: string[],
+  options?: { soaOnly?: boolean }
+): Record<string, unknown> {
+  const fromDomains = domains.filter((domain) => !PUBLIC_MAILBOX_DOMAINS.has(domain));
+  const fromClauses = fromDomains.map((domain) => ({ from: `@${domain}` }));
+  const soaClauses = [
+    { subject: "SOA" },
+    { subject: "statement of account" },
+    { subject: "Statement" },
+  ];
+  if (options?.soaOnly) {
+    if (fromClauses.length === 1) {
+      return { seen: false, ...fromClauses[0], or: soaClauses };
+    }
+    if (fromClauses.length > 1) {
+      return { seen: false, or: [...fromClauses, ...soaClauses] };
+    }
+    return { seen: false, or: soaClauses };
+  }
+  if (fromClauses.length === 1) {
+    return { seen: false, ...fromClauses[0] };
+  }
+  if (fromClauses.length > 1) {
+    return { seen: false, or: fromClauses };
+  }
+  return { seen: false, or: soaClauses };
+}
+
+function describeImapError(error: unknown, user: string, host: string): Error {
+  const record = error && typeof error === "object" ? (error as Record<string, unknown>) : {};
+  const response = String(record.response ?? record.responseText ?? "");
+  const authFailed =
+    record.authenticationFailed === true ||
+    String(record.serverResponseCode ?? "").toUpperCase().includes("AUTHENTICATION") ||
+    /invalid credentials|authenticationfailed/i.test(response);
+  if (authFailed) {
+    const gmail = /gmail/i.test(host) || /gmail\.com$/i.test(user);
+    return new Error(
+      gmail
+        ? `Gmail IMAP rejected login for ${user}. Use a 16-character App Password (Google Account → Security → 2-Step Verification → App passwords), not the normal Gmail password. Save it in Admin → Integrations → EMAIL.`
+        : `IMAP login failed for ${user} on ${host}. Check the username and password in Admin → Integrations → EMAIL.`
+    );
+  }
+  const detail = response || (error instanceof Error ? error.message : String(error));
+  return new Error(`IMAP scan failed (${host}): ${detail}`);
 }
 
 class EmailService {
@@ -39,7 +116,7 @@ class EmailService {
     );
   }
 
-  async scanInvoiceInbox(options?: { throwOnError?: boolean }): Promise<EmailAttachment[]> {
+  async scanInvoiceInbox(options?: { throwOnError?: boolean; soaOnly?: boolean }): Promise<EmailAttachment[]> {
     if (this.fixtures.length > 0) {
       const injected = this.fixtures;
       this.fixtures = [];
@@ -55,13 +132,24 @@ class EmailService {
       return [];
     }
 
+    const supplierDomains = await authorizationService.listSupplierEmailDomains(organizationId);
+    if (supplierDomains.length === 0) {
+      logger.info({ organizationId }, "IMAP scan skipped — no supplier email domains configured");
+      return [];
+    }
+
     const attachments: EmailAttachment[] = [];
+    const imapUser = email.imapUser!.trim();
+    const imapHost = email.imapHost!.trim();
+    // Gmail app passwords are often copied with spaces (xxxx xxxx xxxx xxxx).
+    const imapPassword = email.imapPassword!.replace(/\s+/g, "");
     const client = new ImapFlow({
-      host: email.imapHost!,
+      host: imapHost,
       port: email.imapPort ?? 993,
       secure: true,
-      auth: { user: email.imapUser!, pass: email.imapPassword! },
+      auth: { user: imapUser, pass: imapPassword },
       logger: false,
+      ...IMAP_TIMEOUTS,
     });
 
     try {
@@ -69,14 +157,45 @@ class EmailService {
       const mailbox = email.inboxFolder ?? "INBOX";
       await client.mailboxOpen(mailbox);
 
-      for await (const message of client.fetch({ seen: false }, { envelope: true, bodyStructure: true, uid: true })) {
+      const unread = await client.search(
+        unreadFromSupplierSearch(supplierDomains, { soaOnly: options?.soaOnly }),
+        { uid: true }
+      );
+      const unreadUids = Array.isArray(unread) ? unread : [];
+      const batchUids = unreadUids.slice(0, IMAP_UNREAD_BATCH);
+      if (unreadUids.length > batchUids.length) {
+        logger.info(
+          {
+            organizationId,
+            domains: supplierDomains,
+            matchingUnread: unreadUids.length,
+            processing: batchUids.length,
+            remaining: unreadUids.length - batchUids.length,
+          },
+          "IMAP unread cap — remaining supplier messages stay unread for the next scan"
+        );
+      }
+      if (batchUids.length === 0) {
+        logger.info({ organizationId, domains: supplierDomains }, "No unread supplier emails");
+        return [];
+      }
+
+      for await (const message of client.fetch(
+        batchUids,
+        { envelope: true, bodyStructure: true, uid: true },
+        { uid: true }
+      )) {
         const from = message.envelope?.from?.[0]?.address ?? "unknown@unknown";
+        if (!senderMatchesSupplierDomain(from, supplierDomains)) {
+          logger.info({ from, uid: message.uid }, "Skipping IMAP message — sender is not a supplier domain");
+          continue;
+        }
         const subject = message.envelope?.subject ?? "";
         const messageId = message.envelope?.messageId ?? String(message.uid);
         const parts = this.collectParts(message.bodyStructure);
         logger.info(
           { from, subject, uid: message.uid, parts: parts.map((part) => part.filename ?? part.type) },
-          "Unread inbox message"
+          "Unread supplier inbox message"
         );
         for (const part of parts) {
           const downloaded = await client.download(String(message.uid), part.part, { uid: true });
@@ -94,12 +213,14 @@ class EmailService {
             subject,
             messageId,
             kind: isSoaDocument(filename, subject) ? "soa" : "invoice",
+            uid: message.uid,
           });
         }
       }
     } catch (error) {
-      logger.error({ err: error, organizationId }, "IMAP scan failed");
-      if (options?.throwOnError) throw error;
+      const wrapped = describeImapError(error, imapUser, imapHost);
+      logger.error({ err: error, organizationId }, wrapped.message);
+      if (options?.throwOnError) throw wrapped;
       return [];
     } finally {
       try {
@@ -112,7 +233,7 @@ class EmailService {
     return attachments;
   }
 
-  async markEmailProcessed(messageId: string): Promise<void> {
+  async markEmailProcessed(messageId: string, uid?: number): Promise<void> {
     const organizationId = getOrganizationId();
     const email = await integrationConfigService.getEmail(organizationId);
     if (!integrationConfigService.isEmailConfigured(email)) {
@@ -124,8 +245,12 @@ class EmailService {
       host: email.imapHost!,
       port: email.imapPort ?? 993,
       secure: true,
-      auth: { user: email.imapUser!, pass: email.imapPassword! },
+      auth: {
+        user: email.imapUser!.trim(),
+        pass: email.imapPassword!.replace(/\s+/g, ""),
+      },
       logger: false,
+      ...IMAP_TIMEOUTS,
     });
 
     try {
@@ -137,10 +262,11 @@ class EmailService {
       } catch {
         /* already exists */
       }
-      for await (const message of client.fetch({ seen: false }, { envelope: true, uid: true })) {
-        if (message.envelope?.messageId !== messageId) continue;
-        await client.messageMove(String(message.uid), processed, { uid: true });
-      }
+      const found =
+        uid ??
+        (await client.search({ header: ["Message-ID", messageId] }, { uid: true }))?.[0];
+      if (found == null) return;
+      await client.messageMove(String(found), processed, { uid: true });
     } catch (error) {
       logger.warn({ err: error, messageId }, "Could not move processed email");
     } finally {

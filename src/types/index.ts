@@ -27,7 +27,7 @@ export interface ParsedOrderItem {
   xeroItemId?: string;
   xeroItemCode?: string;
   unitPrice?: number;
-  priceSource?: "history" | "confirmed" | "unknown";
+  priceSource?: "history" | "confirmed" | "unknown" | "xero";
 }
 
 export interface ParsePurchaseOrderResult {
@@ -72,6 +72,7 @@ export interface SoaCompareBucketItem {
 export interface SoaCompareResult {
   matched: SoaCompareBucketItem[];
   missingFromXero: SoaCompareBucketItem[];
+  alreadyPaid: SoaCompareBucketItem[];
   amountMismatch: Array<{
     invoiceNumber: string;
     soaAmount: number;
@@ -85,6 +86,7 @@ export interface XeroItem {
   itemId: string;
   code: string;
   name: string;
+  purchaseUnitPrice?: number;
 }
 
 export interface XeroOpenPurchaseOrder {

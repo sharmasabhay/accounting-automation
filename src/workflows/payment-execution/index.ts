@@ -10,8 +10,14 @@ import { approvalService } from "../../services/approval.service.js";
 import { auditService } from "../../services/audit.service.js";
 import { logger } from "../../utils/logger.js";
 import { logDone, logStep } from "../../utils/workflow-log.js";
-import { notifySupervisorOfXeroError } from "../../utils/xero-error.js";
+import { isXeroError, notifySupervisorOfXeroError } from "../../utils/xero-error.js";
 import type { PayableList } from "../../types/index.js";
+import {
+  asBillIds,
+  billIdsOverlap,
+  cancelStandbyBatches,
+  IN_FLIGHT_PAYMENT_STATUSES,
+} from "../../utils/payment-batch.js";
 
 async function getSupervisorPhone(): Promise<string> {
   return (await organizationService.getSupervisorPhone(getOrganizationId())) ?? "+6590000000";
@@ -48,7 +54,7 @@ export const paymentExecutionWorkflow = {
     if (!hasPayee || !(await dbsPlaywrightService.payeeExists(reconciliation.supplier.dbsPayeeName ?? ""))) {
       await whatsappService.sendText(
         await getSupervisorPhone(),
-        `❌ No saved DBS payee for ${reconciliation.supplier.name}. Payment stopped. The bot will not create new payees.`
+        `There's no saved DBS payee for *${reconciliation.supplier.name}*, so I didn't start payment.\n\nI can't add new payees. Please save this supplier in DBS IDEAL first, then reconcile again.`
       );
       await prisma.workflowRun.update({
         where: { id: workflowRun.id },
@@ -56,6 +62,44 @@ export const paymentExecutionWorkflow = {
       });
       return;
     }
+
+    const billIds = payableList.items.map((item) => item.xeroBillId);
+    const existing = await prisma.paymentBatch.findMany({
+      where: {
+        supplierId: reconciliation.supplierId,
+        status: { in: IN_FLIGHT_PAYMENT_STATUSES },
+      },
+    });
+    const alreadyRaised = existing.find(
+      (row) =>
+        row.status !== PaymentBatchStatus.STANDBY_REQUESTED && billIdsOverlap(row.xeroBillIds, billIds)
+    );
+    if (alreadyRaised) {
+      await whatsappService.sendText(
+        await getSupervisorPhone(),
+        [
+          `These bills are already in a DBS payment for *${reconciliation.supplier.name}*.`,
+          alreadyRaised.dbsTransactionRef ? `Reference: ${alreadyRaised.dbsTransactionRef}` : "Waiting for you to reply *ready*, or for the bank approver.",
+          "I won't submit the same payment again.",
+        ].join("\n")
+      );
+      await prisma.workflowRun.update({
+        where: { id: workflowRun.id },
+        data: { status: WorkflowStatus.CANCELLED, error: "Duplicate payment skipped", completedAt: new Date() },
+      });
+      return;
+    }
+
+    await cancelStandbyBatches(
+      existing
+        .filter(
+          (row) =>
+            row.status === PaymentBatchStatus.STANDBY_REQUESTED &&
+            billIdsOverlap(row.xeroBillIds, billIds)
+        )
+        .map((row) => row.id),
+      "superseded by a new payable list"
+    );
 
     const batch = await prisma.paymentBatch.create({
       data: {
@@ -71,7 +115,14 @@ export const paymentExecutionWorkflow = {
     await approvalService.create({
       workflowRunId: workflowRun.id,
       gateType: ApprovalGateType.DBS_STANDBY,
-      question: `Ready to log in to DBS for payment to ${payableList.supplierName}: S$${payableList.totalAmount.toFixed(2)}, ref: ${payableList.referenceText}. Reply 'ready' when standing by with DBS app.`,
+      question: [
+        `Payable list is ready for *${payableList.supplierName}*.`,
+        "",
+        `Amount: S$${payableList.totalAmount.toFixed(2)}`,
+        `Reference: ${payableList.referenceText}`,
+        "",
+        "Please keep the DBS mobile app open so you can approve the login, then reply *ready*.",
+      ].join("\n"),
       options: ["ready"],
     });
 
@@ -104,27 +155,53 @@ export const paymentExecutionWorkflow = {
     if (!sessionOk) {
       await whatsappService.sendText(
         await getSupervisorPhone(),
-        "DBS session occupied. Will retry in 30 minutes."
+        "DBS is already in use on the office machine. I'll try again in 30 minutes. Reply *ready* then if I haven't come back."
       );
       return;
     }
 
     try {
-      const batches = await prisma.paymentBatch.findMany({
+      const thisBatch = await prisma.paymentBatch.findUnique({
+        where: { id: result.paymentBatchId },
+        include: { supplier: true, reconciliationRun: true },
+      });
+      if (!thisBatch || thisBatch.status !== PaymentBatchStatus.STANDBY_REQUESTED) {
+        await whatsappService.sendText(
+          await getSupervisorPhone(),
+          "That payment is no longer waiting. If it was already submitted, I won't raise it again."
+        );
+        return;
+      }
+
+      const extras = await prisma.paymentBatch.findMany({
         where: {
+          id: { not: thisBatch.id },
           status: PaymentBatchStatus.STANDBY_REQUESTED,
           supplier: { organizationId },
         },
         include: { supplier: true, reconciliationRun: true },
       });
-
-      const ordered = batches.sort((a, b) =>
-        a.id === result.paymentBatchId ? -1 : b.id === result.paymentBatchId ? 1 : 0
+      const duplicates = extras.filter((row) => billIdsOverlap(row.xeroBillIds, thisBatch.xeroBillIds));
+      await cancelStandbyBatches(
+        duplicates.map((row) => row.id),
+        "duplicate of the payment raised from this ready reply"
       );
+      const batches = [thisBatch, ...extras.filter((row) => !billIdsOverlap(row.xeroBillIds, thisBatch.xeroBillIds))];
 
-      for (const batch of ordered) {
+      const raisedBillIds = new Set<string>();
+      for (const batch of batches) {
         const payableList = batch.reconciliationRun?.payableList as PayableList | null;
         if (!payableList) continue;
+        if (asBillIds(batch.xeroBillIds).some((id) => raisedBillIds.has(id))) {
+          await prisma.paymentBatch.update({
+            where: { id: batch.id },
+            data: {
+              status: PaymentBatchStatus.FAILED,
+              error: "Duplicate of a payment already raised in this session",
+            },
+          });
+          continue;
+        }
 
         await prisma.paymentBatch.update({
           where: { id: batch.id },
@@ -141,6 +218,7 @@ export const paymentExecutionWorkflow = {
             raisedAt: new Date(),
           },
         });
+        for (const id of asBillIds(batch.xeroBillIds)) raisedBillIds.add(id);
 
         for (const item of payableList.items) {
           try {
@@ -165,7 +243,14 @@ export const paymentExecutionWorkflow = {
 
         await whatsappService.sendText(
           await getSupervisorPhone(),
-          `✅ Payment raised in DBS: ${batch.supplier.name} S$${Number(batch.totalAmount).toFixed(2)} — ref ${paymentResult.transactionRef}. Bills marked Awaiting Payment (not Paid).`
+          [
+            `Payment submitted in DBS for *${batch.supplier.name}*.`,
+            "",
+            `Amount: S$${Number(batch.totalAmount).toFixed(2)}`,
+            `Reference: ${paymentResult.transactionRef}`,
+            "",
+            "Xero bills are *Awaiting Payment* (not Paid yet). I'll mark them Paid only after the independent DBS approver confirms.",
+          ].join("\n")
         );
         logDone(
           workflowRunId,
@@ -189,7 +274,16 @@ export const paymentExecutionWorkflow = {
       });
     } catch (error) {
       logger.error({ err: error, workflowRunId }, "Payment execution failed after DBS raise");
-      await notifySupervisorOfXeroError("update Xero bills after raising the DBS payment", error);
+      if (isXeroError(error)) {
+        await notifySupervisorOfXeroError("update Xero bills after raising the DBS payment", error);
+      } else {
+        await whatsappService.sendText(
+          await getSupervisorPhone(),
+          `I couldn't submit the DBS payment, so Xero was not updated.\n\n${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
       await prisma.workflowRun.update({
         where: { id: workflowRunId },
         data: {
@@ -237,7 +331,14 @@ export const paymentExecutionWorkflow = {
 
         await whatsappService.sendText(
           await getSupervisorPhone(),
-          `Payment to supplier approved and marked Paid in Xero. Ref: ${batch.dbsTransactionRef}`
+          [
+            `DBS approved the payment to *${batch.supplier.name}*.`,
+            "",
+            `Amount: S$${Number(batch.totalAmount).toFixed(2)}`,
+            `Reference: ${batch.dbsTransactionRef}`,
+            "",
+            "Related bills are now marked *Paid* in Xero.",
+          ].join("\n")
         );
         logDone(undefined, "DBS approved · Xero Paid", batch.dbsTransactionRef);
       } catch (error) {

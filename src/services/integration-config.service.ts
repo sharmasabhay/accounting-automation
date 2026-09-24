@@ -59,7 +59,7 @@ class IntegrationConfigService {
       imapHost: org.imapHost ?? config.EMAIL_IMAP_HOST,
       imapPort: org.imapPort ?? config.EMAIL_IMAP_PORT,
       imapUser: org.imapUser ?? config.EMAIL_IMAP_USER,
-      imapPassword: org.imapPassword ?? config.EMAIL_IMAP_PASSWORD,
+      imapPassword: (org.imapPassword ?? config.EMAIL_IMAP_PASSWORD)?.replace(/\s+/g, ""),
       inboxFolder: org.inboxFolder ?? config.EMAIL_INBOX_FOLDER,
       processedFolder: org.processedFolder ?? config.EMAIL_PROCESSED_FOLDER,
     };

@@ -19,6 +19,34 @@ export function namesMatch(a: string, b: string): boolean {
   return na === nb || na.includes(nb) || nb.includes(na);
 }
 
+const CATALOG_UNITS = /\b(kgs?|grams?|g|pcs?|pkt|packs?|boxes|box|bunches?|bunch|litres?|l|ml)\b/gi;
+
+export function catalogLookupName(name: string): string {
+  return normalizeItemName(name)
+    .replace(CATALOG_UNITS, " ")
+    .replace(/[\-_\/]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function catalogItemMatches(query: string, itemName: string, itemCode?: string): boolean {
+  const q = catalogLookupName(query);
+  const n = catalogLookupName(itemName);
+  const code = catalogLookupName(itemCode ?? "");
+  if (!q) return false;
+  if (q === n || (code && q === code)) return true;
+  if (n.includes(q) || q.includes(n)) return true;
+  if (code && (code.includes(q) || q.includes(code))) return true;
+  const compact = (value: string) => value.replace(/\s+/g, "");
+  if (compact(q) === compact(n)) return true;
+  const qTokens = q.split(" ").filter((token) => token.length > 1);
+  const nTokens = n.split(" ");
+  return (
+    qTokens.length > 0 &&
+    qTokens.every((token) => nTokens.some((part) => part === token || part.includes(token) || token.includes(part)))
+  );
+}
+
 export function quantitiesMatch(invoiceQty: number, poQty: number): boolean {
   return Math.abs(invoiceQty - poQty) < 1e-6;
 }
@@ -129,6 +157,29 @@ export function parsePurchaseOrderLocal(message: string): ParsePurchaseOrderResu
   const colon = parseColonPurchaseOrder(message);
   if (colon.isPurchaseOrder) return colon;
   return parseFreeformPurchaseOrder(message);
+}
+
+export function isRestartCommand(text: string): boolean {
+  const trimmed = text.trim();
+  return /^(restart|cancel|start over|start again|new order|new po|stop|abort|nevermind|never mind)\s*!*$/i.test(
+    trimmed
+  );
+}
+
+export function looksLikeReconcileRequest(text: string): boolean {
+  return /\b(reconcile|statement of account|\bsoa\b)\b/i.test(text);
+}
+
+export function looksLikeSupplierChange(text: string): boolean {
+  return /\b(change|switch|different|another|other)\s+suppliers?\b/i.test(text.trim());
+}
+
+export function looksLikeNewPurchaseOrder(text: string): boolean {
+  const parsed = parsePurchaseOrderLocal(text);
+  if (!parsed.isPurchaseOrder) return false;
+  if (parsed.items.length >= 2) return true;
+  const only = parsed.items[0];
+  return Boolean(only?.unit);
 }
 
 export interface MatchableLine {
@@ -259,15 +310,29 @@ export function selectInvoicePurchaseOrder(
 
 export function compareSoaToXero(
   soaInvoices: Array<{ invoiceNumber: string; amount: number }>,
-  xeroBills: Array<{ invoiceNumber: string; amount: number; xeroBillId: string }>
+  xeroBills: Array<{ invoiceNumber: string; amount: number; xeroBillId: string }>,
+  paidXeroBills: Array<{ invoiceNumber: string; amount: number; xeroBillId: string }> = []
 ): SoaCompareResult {
   const normalizeNumber = (value: string) => value.trim().toLowerCase();
   const usedXero = new Set<string>();
   const matched: SoaCompareBucketItem[] = [];
   const missingFromXero: SoaCompareBucketItem[] = [];
+  const alreadyPaid: SoaCompareBucketItem[] = [];
   const amountMismatch: SoaCompareResult["amountMismatch"] = [];
 
   for (const soa of soaInvoices) {
+    const paid = paidXeroBills.find(
+      (bill) => normalizeNumber(bill.invoiceNumber) === normalizeNumber(soa.invoiceNumber)
+    );
+    if (paid) {
+      alreadyPaid.push({
+        invoiceNumber: soa.invoiceNumber,
+        amount: soa.amount,
+        xeroBillId: paid.xeroBillId,
+      });
+      continue;
+    }
+
     const xero = xeroBills.find(
       (bill) =>
         !usedXero.has(bill.xeroBillId) &&
@@ -302,7 +367,7 @@ export function compareSoaToXero(
       xeroBillId: bill.xeroBillId,
     }));
 
-  return { matched, missingFromXero, amountMismatch, xeroAbsentFromSoa };
+  return { matched, missingFromXero, alreadyPaid, amountMismatch, xeroAbsentFromSoa };
 }
 
 export function parsePoModification(

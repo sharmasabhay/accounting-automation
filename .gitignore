@@ -5,6 +5,7 @@ dist/
 storage/invoices/*
 storage/audit-logs/*
 storage/conversations/*
+storage/dbs-simulated-approvals.json
 !storage/invoices/.gitkeep
 !storage/audit-logs/.gitkeep
 !storage/conversations/.gitkeep

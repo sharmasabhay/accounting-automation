@@ -335,10 +335,13 @@
               <button type="button" id="scan-live-inbox" class="btn primary">Scan live inbox now</button>
             </div>
           </div>
-          <details class="card form-card" style="margin-top:1rem">
+          <details class="card form-card" style="margin-top:1rem" open>
             <summary>Reconcile / DBS (later)</summary>
             <p class="muted" style="margin:.75rem 0">
-              Keep <code>DRY_RUN=true</code> so DBS stays simulated. Xero writes go to the connected test organisation.
+              Keep <code>DRY_RUN=true</code>. After the supervisor replies <code>ready</code>, a
+              Chromium window opens on a <strong>local IDEAL demo</strong> (not real DBS). Watch it
+              log in, wait for mobile approve, pick the saved payee, fill amount / Business Expenses /
+              reference, then submit. Then you click Simulate DBS approved for the second approver.
             </p>
             <form id="test-group-form" class="form-row" style="margin-bottom:.5rem">
               <input name="message" placeholder="@bot remove zucchini" style="flex:1" />
@@ -349,9 +352,13 @@
               <input name="message" placeholder="Please reconcile payment for Fresh Farms" style="flex:1" />
               <button type="submit" class="btn">Reconcile</button>
             </form>
+            <p class="muted" style="margin:0 0 .5rem">
+              Leave the box empty and click the button. Only paste a ref if you have the exact
+              <code>DRY-DBS-1758…</code> value from the supervisor chat (hyphens, including the numbers).
+            </p>
             <form id="test-dbs-approve-form" class="form-row">
-              <input name="transactionRef" placeholder="DRY-DBS-… (blank = latest)" style="flex:1" />
-              <button type="submit" class="btn">Simulate DBS approved</button>
+              <input name="transactionRef" placeholder="leave blank = latest awaiting payment" style="flex:1" />
+              <button type="submit" class="btn primary">Simulate DBS approved</button>
             </form>
           </details>
           <div id="workflow-list" class="table-wrap card"></div>

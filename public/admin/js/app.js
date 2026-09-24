@@ -362,9 +362,16 @@ async function renderIntegrations() {
               ${f.help ? `<div class="field-help">${esc(f.help)}</div>` : ""}
             </div>`;
           }
+          const isPassword = f.type === "password";
+          const shown = isPassword ? "" : esc(String(val));
+          const placeholder = isPassword
+            ? val
+              ? "Leave blank to keep existing, or paste the 16-character app password (spaces optional)"
+              : "Paste the 16-character Gmail app password (spaces optional)"
+            : "";
           return `<div class="form-row">
             <label>${esc(f.label)}</label>
-            <input type="${f.type}" name="${f.key}" value="${esc(String(val))}" placeholder="${f.type === "password" ? "Leave blank to keep existing" : ""}" />
+            <input type="${f.type}" name="${f.key}" value="${shown}" placeholder="${esc(placeholder)}" autocomplete="off" />
             ${f.help ? `<div class="field-help">${esc(f.help)}</div>` : ""}
           </div>`;
         })
@@ -1208,9 +1215,10 @@ function initForms() {
   document.getElementById("test-dbs-approve-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
+    const raw = String(fd.get("transactionRef") || "").trim();
     try {
-      const result = await api.testDbsApprove(currentOrg.slug, fd.get("transactionRef") || undefined);
-      showToast(`Simulated DBS approval ${result.transactionRef}`);
+      const result = await api.testDbsApprove(currentOrg.slug, raw || undefined);
+      showToast(`DBS approved ${result.transactionRef} — bills should now be Paid. Check Supervisor chat.`);
       await renderWorkflows();
       await refreshConversations(true);
     } catch (err) {

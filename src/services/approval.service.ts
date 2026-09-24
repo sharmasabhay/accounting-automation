@@ -30,14 +30,17 @@ class ApprovalService {
     const supervisorPhone =
       (await organizationService.getSupervisorPhone(organizationId)) ?? "+6590000000";
 
-    const replyHint = (input.options ?? ["Yes", "No"]).join(" / ");
-    await whatsappService.sendText(
-      supervisorPhone,
-      `🔔 Approval required (${input.gateType}):\n${input.question}\n\nReply: ${replyHint}`
-    );
+    const options = input.options ?? ["Yes", "No"];
+    const compactOptions = options.every((option) => option.length <= 16);
+    const footer = /reply/i.test(input.question)
+      ? "Or reply *restart* to cancel."
+      : compactOptions
+        ? `Reply ${options.map((option) => `*${option}*`).join(" / ")}. Or *restart* to cancel.`
+        : "Or reply *restart* to cancel.";
+    await whatsappService.sendText(supervisorPhone, `${input.question}\n\n${footer}`);
     logWaiting(
       input.workflowRunId,
-      `Reply in Admin → Activity → Supervisor chat with: ${replyHint}`
+      `Reply in Admin → Activity → Supervisor chat`
     );
 
     await auditService.log({
@@ -106,6 +109,42 @@ class ApprovalService {
       orderBy: { createdAt: "desc" },
       include: { workflowRun: true },
     });
+  }
+
+  async abandonPending(
+    approval: { id: string; workflowRunId: string },
+    reason: string
+  ): Promise<void> {
+    await prisma.approvalRequest.update({
+      where: { id: approval.id },
+      data: {
+        status: ApprovalStatus.EXPIRED,
+        response: reason,
+        resolvedAt: new Date(),
+      },
+    });
+    await prisma.workflowRun.update({
+      where: { id: approval.workflowRunId },
+      data: {
+        status: WorkflowStatus.CANCELLED,
+        error: reason,
+        completedAt: new Date(),
+      },
+    });
+    const run = await prisma.workflowRun.findUnique({
+      where: { id: approval.workflowRunId },
+      select: { type: true, result: true },
+    });
+    if (run?.type === WorkflowType.PAYMENT_EXECUTION) {
+      const batchId = (run.result as { paymentBatchId?: string } | null)?.paymentBatchId;
+      if (batchId) {
+        await prisma.paymentBatch.updateMany({
+          where: { id: batchId, status: "STANDBY_REQUESTED" },
+          data: { status: "FAILED", error: reason },
+        });
+      }
+    }
+    await followUpService.cancelForWorkflow(approval.workflowRunId);
   }
 
   async supersedePendingInvoiceCaptures(

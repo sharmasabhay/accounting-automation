@@ -14,6 +14,7 @@ import { withOrganization } from "../../context/tenant.js";
 import { logger } from "../../utils/logger.js";
 import { invoiceCaptureWorkflow } from "../../workflows/invoice-capture/index.js";
 import { reconciliationWorkflow } from "../../workflows/reconciliation/index.js";
+import { paymentExecutionWorkflow } from "../../workflows/payment-execution/index.js";
 import { dbsPlaywrightService } from "../../services/dbs-playwright.service.js";
 import { skuMappingService } from "../../services/sku-mapping.service.js";
 import { conversationService } from "../../services/conversation.service.js";
@@ -40,7 +41,8 @@ function mergeIntegrationConfig(
   for (const [key, value] of Object.entries(incoming)) {
     if (value === undefined || value === null || value === "") continue;
     if (SENSITIVE_KEYS.has(key) && typeof value === "string" && value.includes("***")) continue;
-    merged[key] = value;
+    merged[key] =
+      SENSITIVE_KEYS.has(key) && typeof value === "string" ? value.replace(/\s+/g, "") : value;
   }
   return merged;
 }
@@ -982,9 +984,10 @@ export async function registerOrganizationRoutes(app: FastifyInstance): Promise<
     const organization = await organizationService.getByIdOrSlug(idOrSlug);
     if (!organization) return reply.code(404).send({ error: "Organization not found" });
 
-    const batch = body.transactionRef
+    const requestedRef = body.transactionRef?.trim().replaceAll("_", "-") || undefined;
+    const batch = requestedRef
       ? await prisma.paymentBatch.findFirst({
-          where: { dbsTransactionRef: body.transactionRef, supplier: { organizationId: organization.id } },
+          where: { dbsTransactionRef: requestedRef, supplier: { organizationId: organization.id } },
         })
       : await prisma.paymentBatch.findFirst({
           where: {
@@ -995,10 +998,21 @@ export async function registerOrganizationRoutes(app: FastifyInstance): Promise<
         });
 
     if (!batch?.dbsTransactionRef) {
-      return reply.code(404).send({ error: "No awaiting DBS payment batch found" });
+      return reply.code(404).send({
+        error: requestedRef
+          ? `No payment batch found for "${requestedRef}". Leave the field blank to use the latest, or paste the exact DRY-DBS-… ref from the supervisor message after you reply ready.`
+          : 'No payment is waiting for bank approval yet. Finish reconcile, then in Supervisor chat reply "ready". After that, leave this field blank and click Simulate DBS approved.',
+      });
+    }
+
+    if (batch.status !== "AWAITING_BANK_APPROVAL") {
+      return reply.code(400).send({
+        error: `This batch is "${batch.status}", not awaiting bank approval. Reply "ready" in Supervisor chat first, then simulate approval.`,
+      });
     }
 
     dbsPlaywrightService.simulateApproval(batch.dbsTransactionRef);
+    await withOrganization(organization.id, () => paymentExecutionWorkflow.monitorApprovals());
     await enqueueJob("payment.monitor", {
       scheduledAt: new Date().toISOString(),
       organizationId: organization.id,

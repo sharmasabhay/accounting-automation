@@ -132,11 +132,11 @@ function stringify(value: unknown): string {
 }
 
 function smtpConfig(): { host: string; port: number; user: string; pass: string; from: string } | null {
-  const user = config.ERROR_ALERT_SMTP_USER || config.EMAIL_IMAP_USER;
-  const pass = config.ERROR_ALERT_SMTP_PASSWORD || config.EMAIL_IMAP_PASSWORD;
+  const user = config.ERROR_ALERT_SMTP_USER;
+  const pass = config.ERROR_ALERT_SMTP_PASSWORD;
   if (!user || !pass) return null;
 
-  const looksGmail = /gmail\.com$/i.test(user) || /gmail/i.test(config.EMAIL_IMAP_HOST ?? "");
+  const looksGmail = /gmail\.com$/i.test(user);
   const host = config.ERROR_ALERT_SMTP_HOST || (looksGmail ? "smtp.gmail.com" : "");
   if (!host) return null;
 
@@ -144,7 +144,7 @@ function smtpConfig(): { host: string; port: number; user: string; pass: string;
     host,
     port: config.ERROR_ALERT_SMTP_PORT,
     user,
-    pass,
+    pass: pass.replace(/\s+/g, ""),
     from: config.ERROR_ALERT_FROM || user,
   };
 }
@@ -155,7 +155,7 @@ async function sendAlertEmail(subject: string, text: string): Promise<void> {
     if (!missingSmtpLogged) {
       missingSmtpLogged = true;
       console.error(
-        "Backend error alerts are enabled but SMTP is not configured. Set ERROR_ALERT_SMTP_USER/PASSWORD or EMAIL_IMAP_USER/PASSWORD."
+        "Backend error alerts skipped: set ERROR_ALERT_SMTP_USER and ERROR_ALERT_SMTP_PASSWORD (Gmail needs an App Password). IMAP credentials are not used for alerts."
       );
     }
     console.error(`Error alert (not emailed):\n${subject}\n${text.slice(0, 2000)}`);

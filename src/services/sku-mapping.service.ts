@@ -1,5 +1,5 @@
 import { prisma } from "../db/client.js";
-import { namesMatch, normalizeItemName } from "../utils/matching.js";
+import { catalogItemMatches, namesMatch, normalizeItemName } from "../utils/matching.js";
 import { xeroService } from "./xero.service.js";
 import type { XeroItem } from "../types/index.js";
 
@@ -84,7 +84,7 @@ class SkuMappingService {
 
   matchCatalog(name: string, catalog: XeroItem[]): XeroItem[] {
     return catalog.filter(
-      (item) => namesMatch(item.name, name) || namesMatch(item.code, name)
+      (item) => catalogItemMatches(name, item.name, item.code) || namesMatch(item.code, name)
     );
   }
 
@@ -108,12 +108,20 @@ class SkuMappingService {
 
     const catalog = await xeroService.listItems(organizationId);
     if (catalog.length === 0) {
-      return { ambiguous: false, needsConfirmation: false };
+      return { ambiguous: false, needsConfirmation: true };
     }
 
     const matches = this.matchCatalog(itemName, catalog);
     if (matches.length === 1) {
-      return { item: matches[0], ambiguous: false, needsConfirmation: false };
+      const item = matches[0]!;
+      await this.confirm({
+        supplierId,
+        supplierItemName: itemName,
+        xeroItemId: item.itemId,
+        xeroItemCode: item.code,
+        confirmedBy: "xero-catalog",
+      });
+      return { item, ambiguous: false, needsConfirmation: false };
     }
     if (matches.length > 1) {
       return { ambiguous: true, needsConfirmation: true };

@@ -90,6 +90,8 @@ interface XeroItemsResponse {
     ItemID?: string;
     Code?: string;
     Name?: string;
+    PurchaseDetails?: { UnitPrice?: number };
+    SalesDetails?: { UnitPrice?: number };
   }>;
 }
 
@@ -107,7 +109,19 @@ interface XeroInvoicesResponse {
   }>;
 }
 
+interface XeroAccountsResponse {
+  Accounts?: Array<{
+    AccountID?: string;
+    Code?: string;
+    Name?: string;
+    Type?: string;
+    Status?: string;
+    Class?: string;
+  }>;
+}
+
 class XeroService {
+  private accountCache = new Map<string, { bankAccountId?: string; expenseCode?: string }>();
   private async getOrgConfig(organizationId: string): Promise<XeroIntegrationConfig> {
     return integrationConfigService.getXero(organizationId);
   }
@@ -130,8 +144,9 @@ class XeroService {
       "accounting.contacts",
       "accounting.attachments",
       "accounting.invoices",
-      "accounting.payments",
-      "accounting.purchaseorders",
+      "accounting.payments",      
+      "accounting.settings",
+      "accounting.settings.read"
     ];
 
     const params = new URLSearchParams({
@@ -237,14 +252,28 @@ class XeroService {
       return [];
     }
 
-    const result = await this.xeroApiRequest<XeroItemsResponse>(organizationId, "GET", "/Items");
-    return (result.Items ?? [])
-      .filter((item) => item.ItemID && item.Name)
-      .map((item) => ({
-        itemId: item.ItemID!,
-        code: item.Code ?? item.ItemID!,
-        name: item.Name!,
-      }));
+    const items: XeroItem[] = [];
+    for (let page = 1; page <= 10; page++) {
+      const result = await this.xeroApiRequest<XeroItemsResponse>(
+        organizationId,
+        "GET",
+        `/Items?page=${page}`
+      );
+      const batch = result.Items ?? [];
+      for (const item of batch) {
+        if (!item.ItemID || !item.Name) continue;
+        const purchasePrice = item.PurchaseDetails?.UnitPrice ?? item.SalesDetails?.UnitPrice;
+        items.push({
+          itemId: item.ItemID,
+          code: item.Code ?? item.ItemID,
+          name: item.Name,
+          purchaseUnitPrice:
+            purchasePrice != null && Number(purchasePrice) > 0 ? Number(purchasePrice) : undefined,
+        });
+      }
+      if (batch.length < 100) break;
+    }
+    return items;
   }
 
   private async isConfiguredForOrg(organizationId: string): Promise<boolean> {
@@ -430,6 +459,64 @@ class XeroService {
 
   private isXeroUuid(value: string): boolean {
     return UUID_RE.test(value);
+  }
+
+  private async listAccounts(
+    organizationId: string
+  ): Promise<NonNullable<XeroAccountsResponse["Accounts"]>> {
+    const result = await this.xeroApiRequest<XeroAccountsResponse>(organizationId, "GET", "/Accounts");
+    return result.Accounts ?? [];
+  }
+
+  private async resolveBankAccountId(organizationId: string): Promise<string> {
+    const cached = this.accountCache.get(organizationId)?.bankAccountId;
+    if (cached) return cached;
+
+    const accounts = await this.listAccounts(organizationId);
+    const bank = accounts.find(
+      (account) => account.Type === "BANK" && account.Status === "ACTIVE" && account.AccountID
+    );
+    if (!bank?.AccountID) {
+      throw new XeroApiError(
+        "Xero has no active bank account to record the payment against. Add a bank account in Xero Chart of Accounts, then try again."
+      );
+    }
+
+    const entry = this.accountCache.get(organizationId) ?? {};
+    entry.bankAccountId = bank.AccountID;
+    this.accountCache.set(organizationId, entry);
+    logger.info(
+      { organizationId, bankCode: bank.Code, bankName: bank.Name },
+      "Using Xero bank account for payment"
+    );
+    return bank.AccountID;
+  }
+
+  private async resolveExpenseAccountCode(organizationId: string): Promise<string> {
+    const cached = this.accountCache.get(organizationId)?.expenseCode;
+    if (cached) return cached;
+
+    const accounts = await this.listAccounts(organizationId);
+    const preferred = ["400", "429", "310", "453", "200"];
+    const expenses = accounts.filter(
+      (account) =>
+        account.Status === "ACTIVE" &&
+        Boolean(account.Code) &&
+        (account.Type === "EXPENSE" || account.Type === "DIRECTCOSTS" || account.Class === "EXPENSE")
+    );
+    const match =
+      preferred.map((code) => expenses.find((account) => account.Code === code)).find(Boolean) ??
+      expenses[0];
+    if (!match?.Code) {
+      throw new XeroApiError(
+        "Xero has no active expense account for bill line items. Add one in Chart of Accounts, then try again."
+      );
+    }
+
+    const entry = this.accountCache.get(organizationId) ?? {};
+    entry.expenseCode = match.Code;
+    this.accountCache.set(organizationId, entry);
+    return match.Code;
   }
 
   private async resolveContactId(
@@ -686,12 +773,13 @@ class XeroService {
         input.supplierContactId,
         input.contactName
       );
+      const expenseCode = await this.resolveExpenseAccountCode(organizationId);
       const lineItems = input.lineItems
         .map((line) => ({
           Description: line.description,
           Quantity: line.quantity,
           UnitAmount: line.unitAmount,
-          AccountCode: "400",
+          AccountCode: expenseCode,
           ...(line.itemCode ? { ItemCode: line.itemCode } : {}),
         }))
         .filter((line) => line.Description && line.Quantity > 0);
@@ -818,11 +906,12 @@ class XeroService {
         `/Invoices/${xeroBillId}`
       );
       const amount = invoice.Invoices?.[0]?.AmountDue ?? invoice.Invoices?.[0]?.Total ?? 0;
+      const bankAccountId = await this.resolveBankAccountId(organizationId);
       await this.xeroApiRequest(organizationId, "PUT", "/Payments", {
         Payments: [
           {
             Invoice: { InvoiceID: xeroBillId },
-            Account: { Code: "090" },
+            Account: { AccountID: bankAccountId },
             Date: new Date().toISOString().slice(0, 10),
             Amount: amount,
             Reference: note,
@@ -900,22 +989,52 @@ class XeroService {
     start: Date,
     end: Date
   ): Promise<XeroBillRecord[]> {
-    const local = await prisma.xeroBill.findMany({
+    const { unpaid } = await this.getReconciliationBillsForPeriod(
+      organizationId,
+      supplierContactId,
+      start,
+      end
+    );
+    return unpaid;
+  }
+
+  async getReconciliationBillsForPeriod(
+    organizationId: string,
+    supplierContactId: string,
+    start: Date,
+    end: Date
+  ): Promise<{ unpaid: XeroBillRecord[]; paid: XeroBillRecord[] }> {
+    const localUnpaid = await prisma.xeroBill.findMany({
       where: {
         invoiceDate: { gte: start, lte: end },
+        status: { in: ["SUBMITTED", "AWAITING_PAYMENT"] },
         supplier: {
           organizationId,
           OR: [{ xeroContactId: supplierContactId }, { id: supplierContactId }],
         },
       },
     });
-    const fromLocal: XeroBillRecord[] = local.map((bill) => ({
+    const localPaid = await prisma.xeroBill.findMany({
+      where: {
+        invoiceDate: { gte: start, lte: end },
+        status: "PAID",
+        supplier: {
+          organizationId,
+          OR: [{ xeroContactId: supplierContactId }, { id: supplierContactId }],
+        },
+      },
+    });
+    const mapLocal = (bill: (typeof localUnpaid)[number]): XeroBillRecord => ({
       xeroBillId: bill.xeroBillId ?? bill.id,
       invoiceNumber: bill.invoiceNumber ?? "UNKNOWN",
       invoiceDate: (bill.invoiceDate ?? bill.createdAt).toISOString().slice(0, 10),
       total: Number(bill.totalAmount ?? 0),
       status: bill.status,
-    }));
+    });
+    const fromLocal = {
+      unpaid: localUnpaid.map(mapLocal),
+      paid: localPaid.map(mapLocal),
+    };
 
     if (!(await this.isConfiguredForOrg(organizationId))) {
       return fromLocal;
@@ -930,18 +1049,29 @@ class XeroService {
       const result = await this.xeroApiRequest<XeroInvoicesResponse>(
         organizationId,
         "GET",
-        `/Invoices?where=Type=="ACCPAY" AND Contact.ContactID==Guid("${contactId}") AND Date>=DateTime(${startStr.replaceAll("-", ",")}) AND Date<=DateTime(${endStr.replaceAll("-", ",")})`
+        `/Invoices?where=Type=="ACCPAY" AND Contact.ContactID==Guid("${contactId}") AND Date>=DateTime(${startStr.replaceAll("-", ",")}) AND Date<=DateTime(${endStr.replaceAll("-", ",")}) AND Status!="VOIDED" AND Status!="DELETED"`
       );
-      const fromXero = (result.Invoices ?? [])
-        .filter((invoice) => invoice.InvoiceID)
-        .map((invoice) => ({
-          xeroBillId: invoice.InvoiceID!,
+      const unpaid: XeroBillRecord[] = [];
+      const paid: XeroBillRecord[] = [];
+      for (const invoice of result.Invoices ?? []) {
+        if (!invoice.InvoiceID) continue;
+        const status = (invoice.Status ?? "").toUpperCase();
+        if (status === "VOIDED" || status === "DELETED") continue;
+        const amountDue = invoice.AmountDue;
+        const isPaid = status === "PAID" || (amountDue != null && amountDue <= 0);
+        const row: XeroBillRecord = {
+          xeroBillId: invoice.InvoiceID,
           invoiceNumber: invoice.InvoiceNumber ?? "UNKNOWN",
           invoiceDate: (invoice.DateString ?? invoice.Date ?? "").slice(0, 10),
-          total: Number(invoice.Total ?? 0),
+          total: Number(
+            !isPaid && amountDue != null && amountDue > 0 ? amountDue : invoice.Total ?? 0
+          ),
           status: invoice.Status ?? "AUTHORISED",
-        }));
-      return fromXero.length ? fromXero : fromLocal;
+        };
+        if (isPaid) paid.push(row);
+        else unpaid.push(row);
+      }
+      return { unpaid, paid };
     } catch (error) {
       logger.warn({ err: error }, "Falling back to local bills for period");
       await notifySupervisorOfXeroError("look up bills for reconciliation", error);

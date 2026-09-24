@@ -13,7 +13,7 @@ import { skuMappingService } from "../../services/sku-mapping.service.js";
 import { BOT_HELP_GUIDE } from "../../prompts/system.js";
 import { logger } from "../../utils/logger.js";
 import { logDone, logStep } from "../../utils/workflow-log.js";
-import { parsePoModification } from "../../utils/matching.js";
+import { parsePoModification, looksLikeSupplierChange, isRestartCommand } from "../../utils/matching.js";
 import { isXeroError, notifySupervisorOfXeroError } from "../../utils/xero-error.js";
 import type { ParsedOrderItem, WhatsAppInboundMessage } from "../../types/index.js";
 
@@ -21,6 +21,7 @@ interface PoDraftPayload {
   items: ResolvedPoItem[];
   supplierId?: string;
   supplierName?: string;
+  supplierConfirmed?: boolean;
   messageId: string;
   from: string;
   originalText: string;
@@ -150,8 +151,40 @@ export const poIntakeWorkflow = {
         },
         ApprovalGateType.SUPPLIER_CLARIFICATION,
         `Which supplier should this order go to?${names ? ` Known suppliers: ${names}` : ""}`,
-        ["Reply with the supplier name"],
+        ["supplier name"],
         "1.3-supplier-clarification"
+      );
+      return;
+    }
+
+    if (resolved.inferredFromHistory && !draft.supplierConfirmed) {
+      const names = (
+        await prisma.supplier.findMany({
+          where: { organizationId, isActive: true },
+          select: { name: true },
+        })
+      )
+        .map((s) => s.name)
+        .join(", ");
+      await this.awaitApproval(
+        workflowRunId,
+        {
+          ...draft,
+          supplierId: resolved.supplier.id,
+          supplierName: resolved.supplier.name,
+          pendingGate: "SUPPLIER_CLARIFICATION",
+        },
+        ApprovalGateType.SUPPLIER_CLARIFICATION,
+        [
+          `I'll send this to *${resolved.supplier.name}* (from your last similar order).`,
+          "",
+          "Reply *yes* to keep this supplier, or send a different supplier name.",
+          names ? `Known suppliers: ${names}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        ["yes", "change supplier"],
+        "1.3-supplier-confirm"
       );
       return;
     }
@@ -229,9 +262,9 @@ export const poIntakeWorkflow = {
         "Items:",
         formatItems(items),
         "",
-        "Reply *yes* to create the PO, or *no* to cancel.",
+        "Reply *yes* to create the PO, *change supplier* to pick another supplier, or *no* to cancel.",
       ].join("\n"),
-      ["yes", "no"],
+      ["yes", "change supplier", "no"],
       "1.5-confirm-items"
     );
   },
@@ -330,12 +363,78 @@ export const poIntakeWorkflow = {
       return;
     }
 
+    if (isRestartCommand(answer)) {
+      const to = draft.from ?? (await organizationService.getSupervisorPhone(getOrganizationId()));
+      if (to) {
+        await whatsappService.sendText(
+          to,
+          "Cancelled the previous request. Send a new order when you are ready.\n\n" + BOT_HELP_GUIDE
+        );
+      }
+      await this.finish(workflowRunId, WorkflowStatus.CANCELLED);
+      return;
+    }
+
     if (gateType === ApprovalGateType.SUPPLIER_CLARIFICATION) {
+      if ((lower === "yes" || lower === "keep" || lower === "ok" || lower === "okay") && draft.supplierId) {
+        draft.supplierConfirmed = true;
+        await this.saveDraft(workflowRunId, draft);
+        await this.continueResolution(workflowRunId, draft.supplierName);
+        return;
+      }
+      if (looksLikeSupplierChange(answer)) {
+        const names = (
+          await prisma.supplier.findMany({
+            where: { organizationId: getOrganizationId(), isActive: true },
+            select: { name: true },
+          })
+        )
+          .map((s) => s.name)
+          .join(", ");
+        draft.supplierConfirmed = false;
+        draft.supplierId = undefined;
+        draft.supplierName = undefined;
+        await this.awaitApproval(
+          workflowRunId,
+          { ...draft, pendingGate: "SUPPLIER_CLARIFICATION" },
+          ApprovalGateType.SUPPLIER_CLARIFICATION,
+          `Which supplier should this order go to?${names ? ` Known suppliers: ${names}` : ""}`,
+          ["supplier name"],
+          "1.3-supplier-clarification"
+        );
+        return;
+      }
+      draft.supplierConfirmed = true;
+      draft.supplierId = undefined;
+      draft.supplierName = undefined;
+      await this.saveDraft(workflowRunId, draft);
       await this.continueResolution(workflowRunId, answer);
       return;
     }
 
     if (gateType === ApprovalGateType.NEW_PO_PRICE) {
+      if (looksLikeSupplierChange(answer)) {
+        const names = (
+          await prisma.supplier.findMany({
+            where: { organizationId: getOrganizationId(), isActive: true },
+            select: { name: true },
+          })
+        )
+          .map((s) => s.name)
+          .join(", ");
+        draft.supplierConfirmed = false;
+        draft.supplierId = undefined;
+        draft.supplierName = undefined;
+        await this.awaitApproval(
+          workflowRunId,
+          { ...draft, pendingGate: "SUPPLIER_CLARIFICATION" },
+          ApprovalGateType.SUPPLIER_CLARIFICATION,
+          `Which supplier should this order go to?${names ? ` Known suppliers: ${names}` : ""}`,
+          ["supplier name"],
+          "1.3-supplier-clarification"
+        );
+        return;
+      }
       const price = parseFloat(answer.replace(/[^0-9.]/g, ""));
       if (!(price > 0)) {
         await approvalService.create({
@@ -361,6 +460,28 @@ export const poIntakeWorkflow = {
     }
 
     if (gateType === ApprovalGateType.SKU_CLARIFICATION && draft.pendingGate === "SKU_CLARIFICATION") {
+      if (looksLikeSupplierChange(answer)) {
+        const names = (
+          await prisma.supplier.findMany({
+            where: { organizationId: getOrganizationId(), isActive: true },
+            select: { name: true },
+          })
+        )
+          .map((s) => s.name)
+          .join(", ");
+        draft.supplierConfirmed = false;
+        draft.supplierId = undefined;
+        draft.supplierName = undefined;
+        await this.awaitApproval(
+          workflowRunId,
+          { ...draft, pendingGate: "SUPPLIER_CLARIFICATION" },
+          ApprovalGateType.SUPPLIER_CLARIFICATION,
+          `Which supplier should this order go to?${names ? ` Known suppliers: ${names}` : ""}`,
+          ["supplier name"],
+          "1.3-supplier-clarification"
+        );
+        return;
+      }
       const idx = draft.items.findIndex((item) => item.needsSkuConfirmation);
       if (idx >= 0 && draft.supplierId) {
         const item = draft.items[idx]!;
@@ -399,6 +520,28 @@ export const poIntakeWorkflow = {
     }
 
     if (gateType === ApprovalGateType.SKU_CLARIFICATION) {
+      if (looksLikeSupplierChange(answer)) {
+        const names = (
+          await prisma.supplier.findMany({
+            where: { organizationId: getOrganizationId(), isActive: true },
+            select: { name: true },
+          })
+        )
+          .map((s) => s.name)
+          .join(", ");
+        draft.supplierConfirmed = false;
+        draft.supplierId = undefined;
+        draft.supplierName = undefined;
+        await this.awaitApproval(
+          workflowRunId,
+          { ...draft, pendingGate: "SUPPLIER_CLARIFICATION" },
+          ApprovalGateType.SUPPLIER_CLARIFICATION,
+          `Which supplier should this order go to?${names ? ` Known suppliers: ${names}` : ""}`,
+          ["supplier name"],
+          "1.3-supplier-clarification"
+        );
+        return;
+      }
       if (lower === "yes" || lower === "approve") {
         await this.createConfirmedPurchaseOrder(workflowRunId);
         return;

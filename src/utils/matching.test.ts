@@ -11,10 +11,14 @@ import {
   parsePoModification,
   isSoaDocument,
   namesMatch,
+  catalogItemMatches,
   extractReconcileSupplierName,
   matchSupplierNameInText,
   parsePeriodFromText,
   parseReconcilePeriod,
+  isRestartCommand,
+  looksLikeNewPurchaseOrder,
+  looksLikeSupplierChange,
 } from "./matching.js";
 
 describe("PO parse", () => {
@@ -37,6 +41,14 @@ describe("PO parse", () => {
   it("rejects help text", () => {
     const result = parsePurchaseOrderLocal("help");
     assert.equal(result.isPurchaseOrder, false);
+  });
+
+  it("treats a restated order as a new PO, not an approval answer", () => {
+    assert.equal(looksLikeNewPurchaseOrder("Apple 10kg, banana 5kg"), true);
+    assert.equal(looksLikeNewPurchaseOrder("3.50"), false);
+    assert.equal(looksLikeNewPurchaseOrder("yes"), false);
+    assert.equal(isRestartCommand("restart"), true);
+    assert.equal(looksLikeSupplierChange("change supplier"), true);
   });
 });
 
@@ -162,6 +174,13 @@ describe("SKU name matching", () => {
   it("matches similar names", () => {
     assert.equal(namesMatch("Bok Choy", "bok choy"), true);
   });
+
+  it("matches unmapped chat names to Xero catalog names", () => {
+    assert.equal(catalogItemMatches("Bok choy", "Bok Choy"), true);
+    assert.equal(catalogItemMatches("zucchini", "Organic Zucchini"), true);
+    assert.equal(catalogItemMatches("Bok choy 10kg", "Bok-Choy"), true);
+    assert.equal(catalogItemMatches("zucchini", "ZUCC", "ZUCC"), true);
+  });
 });
 
 describe("SOA compare", () => {
@@ -182,6 +201,21 @@ describe("SOA compare", () => {
     assert.equal(result.amountMismatch.length, 1);
     assert.equal(result.missingFromXero[0]?.invoiceNumber, "INV-3");
     assert.equal(result.xeroAbsentFromSoa[0]?.invoiceNumber, "INV-9");
+    assert.equal(result.alreadyPaid.length, 0);
+  });
+
+  it("skips SOA invoices that are already paid in Xero", () => {
+    const result = compareSoaToXero(
+      [
+        { invoiceNumber: "INV-PAID", amount: 50 },
+        { invoiceNumber: "INV-OPEN", amount: 20 },
+      ],
+      [{ invoiceNumber: "INV-OPEN", amount: 20, xeroBillId: "open" }],
+      [{ invoiceNumber: "INV-PAID", amount: 50, xeroBillId: "paid" }]
+    );
+    assert.equal(result.alreadyPaid[0]?.invoiceNumber, "INV-PAID");
+    assert.equal(result.matched[0]?.invoiceNumber, "INV-OPEN");
+    assert.equal(result.missingFromXero.length, 0);
   });
 });
 
