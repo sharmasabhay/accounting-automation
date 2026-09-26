@@ -149,7 +149,6 @@ class XeroService {
       "accounting.attachments",
       "accounting.invoices",
       "accounting.payments",
-      "accounting.items",
       "accounting.settings",
       "accounting.settings.read"
     ];
