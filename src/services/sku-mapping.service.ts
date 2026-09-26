@@ -1,5 +1,5 @@
 import { prisma } from "../db/client.js";
-import { catalogItemMatches, namesMatch, normalizeItemName } from "../utils/matching.js";
+import { catalogItemMatches, namesMatch, normalizeItemName, isPlausibleItemCode } from "../utils/matching.js";
 import { xeroService } from "./xero.service.js";
 import type { XeroItem } from "../types/index.js";
 
@@ -27,20 +27,45 @@ class SkuMappingService {
     answer: string,
     confirmedBy?: string
   ): Promise<{ itemId: string; code: string }> {
-    const code = answer.trim();
+    return this.ensureMappedItem(organizationId, supplierId, supplierItemName, {
+      code: answer,
+      confirmedBy,
+    });
+  }
+
+  async ensureMappedItem(
+    organizationId: string,
+    supplierId: string,
+    supplierItemName: string,
+    options?: { code?: string; unitPrice?: number; confirmedBy?: string }
+  ): Promise<{ itemId: string; code: string; name: string }> {
     const catalog = await xeroService.listItems(organizationId);
-    const matches = this.matchCatalog(code, catalog);
-    const chosen = matches[0];
-    const itemId = chosen?.itemId ?? code;
-    const itemCode = chosen?.code ?? code;
+    const requested = options?.code?.trim();
+    const matches = requested
+      ? this.matchCatalog(requested, catalog)
+      : this.matchCatalog(supplierItemName, catalog);
+    const chosen =
+      matches[0] ??
+      (requested
+        ? catalog.find((item) => item.code.toLowerCase() === requested.toLowerCase())
+        : undefined);
+
+    const item =
+      chosen ??
+      (await xeroService.ensurePurchaseItem(organizationId, {
+        name: supplierItemName,
+        code: requested && isPlausibleItemCode(requested) ? requested : undefined,
+        unitPrice: options?.unitPrice,
+      }));
+
     await this.confirm({
       supplierId,
       supplierItemName,
-      xeroItemId: itemId,
-      xeroItemCode: itemCode,
-      confirmedBy,
+      xeroItemId: item.itemId,
+      xeroItemCode: item.code,
+      confirmedBy: options?.confirmedBy,
     });
-    return { itemId, code: itemCode };
+    return { itemId: item.itemId, code: item.code, name: item.name };
   }
 
   async find(supplierId: string, supplierItemName: string) {
@@ -94,19 +119,30 @@ class SkuMappingService {
     itemName: string
   ): Promise<{ item?: XeroItem; ambiguous: boolean; needsConfirmation: boolean }> {
     const mapped = await this.find(supplierId, itemName);
-    if (mapped) {
-      return {
-        item: {
+    const catalog = await xeroService.listItems(organizationId);
+    const mappedCode = mapped?.xeroItemCode ?? mapped?.xeroItemId;
+    const mappedExists =
+      mapped &&
+      isPlausibleItemCode(mappedCode ?? "") &&
+      catalog.some(
+        (item) =>
+          item.itemId === mapped.xeroItemId ||
+          item.code.toLowerCase() === (mappedCode ?? "").toLowerCase()
+      );
+    if (mappedExists && mapped) {
+      const item =
+        catalog.find(
+          (row) =>
+            row.itemId === mapped.xeroItemId ||
+            row.code.toLowerCase() === (mappedCode ?? "").toLowerCase()
+        ) ?? {
           itemId: mapped.xeroItemId,
           code: mapped.xeroItemCode ?? mapped.xeroItemId,
           name: itemName,
-        },
-        ambiguous: false,
-        needsConfirmation: false,
-      };
+        };
+      return { item, ambiguous: false, needsConfirmation: false };
     }
 
-    const catalog = await xeroService.listItems(organizationId);
     if (catalog.length === 0) {
       return { ambiguous: false, needsConfirmation: true };
     }

@@ -80,6 +80,122 @@ export function isSoaDocument(filename?: string, subject?: string): boolean {
 
 const HELP_ITEM = /^(help|hi|hello|yes|no|ready|approve)$/i;
 
+/** Strip WhatsApp markdown wrappers so *yes* and yes match the same command. */
+export function normalizeChatReply(text: string): string {
+  return text
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .trim()
+    .replace(/^["'`“”]+|["'`“”]+$/g, "")
+    .replace(/^[*_~]+|[*_~]+$/g, "")
+    .replace(/[.!?]+$/g, "")
+    .trim();
+}
+
+export function chatReplyKey(text: string): string {
+  return normalizeChatReply(text).toLowerCase().replace(/\s+/g, " ");
+}
+
+export function isAffirmativeReply(text: string): boolean {
+  return /^(yes|y|yeah|yep|yup|ok|okay|approve|approved|confirm|confirmed|sure|keep)$/i.test(
+    chatReplyKey(text)
+  );
+}
+
+export function isNegativeReply(text: string): boolean {
+  return /^(no|n|nope|nah|decline|reject|rejected)$/i.test(chatReplyKey(text));
+}
+
+export function isReadyReply(text: string): boolean {
+  return /^(ready|ok ready|i'm ready|im ready)$/i.test(chatReplyKey(text));
+}
+
+export function suggestedItemCode(name: string): string {
+  const compact = name
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "")
+    .slice(0, 30);
+  return compact || "ITEM";
+}
+
+export function isPlausibleItemCode(value: string): boolean {
+  const code = value.trim();
+  if (!code || code.length > 30) return false;
+  if (isAffirmativeReply(code) || isNegativeReply(code) || isReadyReply(code)) return false;
+  if (/^[*_~`]+/.test(code)) return false;
+  if (/^\d+(\.\d+)?$/.test(code)) return false;
+  return /^[A-Z0-9][A-Z0-9_-]{0,29}$/i.test(code);
+}
+
+export interface PoItemDetailReply {
+  itemName: string;
+  code?: string;
+  unitPrice?: number;
+}
+
+export function parsePoItemDetailsReply(
+  text: string,
+  itemNames: string[]
+): PoItemDetailReply[] {
+  const names = itemNames.map((name) => name.trim()).filter(Boolean);
+  const chunks = text
+    .split(/\r?\n|;/)
+    .flatMap((line) => line.split(/\s*,\s*(?=[A-Za-z])/))
+    .map((chunk) => normalizeChatReply(chunk))
+    .filter(Boolean);
+
+  const numbered = chunks
+    .map((chunk) => chunk.match(/^(\d+(?:\.\d+)?)$/)?.[1])
+    .filter((value): value is string => Boolean(value))
+    .map((value) => Number(value))
+    .filter((value) => value > 0);
+  if (numbered.length === names.length && numbered.length === chunks.length) {
+    return names.map((itemName, index) => ({ itemName, unitPrice: numbered[index] }));
+  }
+  if (chunks.length === 1 && names.length === 1 && isPlausibleItemCode(chunks[0]!)) {
+    return [{ itemName: names[0]!, code: chunks[0]!.toUpperCase() }];
+  }
+
+  const results: PoItemDetailReply[] = [];
+  for (const chunk of chunks) {
+    const withCode = chunk.match(
+      /^(.+?)\s*:\s*([A-Za-z0-9][A-Za-z0-9_-]{0,29})\s+(\d+(?:\.\d+)?)\s*$/
+    );
+    const namedPrice = chunk.match(/^(.+?)\s*:\s*(\d+(?:\.\d+)?)\s*$/);
+    const namedCode = chunk.match(/^(.+?)\s*:\s*([A-Za-z0-9][A-Za-z0-9_-]{0,29})\s*$/);
+    const codePrice = chunk.match(/^([A-Za-z0-9][A-Za-z0-9_-]{0,29})\s+(\d+(?:\.\d+)?)\s*$/);
+
+    if (withCode && isPlausibleItemCode(withCode[2]!) && Number(withCode[3]) > 0) {
+      const itemName = matchDetailName(withCode[1]!, names) ?? withCode[1]!.trim();
+      results.push({ itemName, code: withCode[2]!.toUpperCase(), unitPrice: Number(withCode[3]) });
+      continue;
+    }
+    if (namedPrice && Number(namedPrice[2]) > 0) {
+      const itemName = matchDetailName(namedPrice[1]!, names) ?? namedPrice[1]!.trim();
+      results.push({ itemName, unitPrice: Number(namedPrice[2]) });
+      continue;
+    }
+    if (namedCode && isPlausibleItemCode(namedCode[2]!)) {
+      const itemName = matchDetailName(namedCode[1]!, names) ?? namedCode[1]!.trim();
+      results.push({ itemName, code: namedCode[2]!.toUpperCase() });
+      continue;
+    }
+    if (codePrice && names.length === 1 && Number(codePrice[2]) > 0) {
+      const code = codePrice[1]!;
+      results.push({
+        itemName: names[0]!,
+        ...(isPlausibleItemCode(code) ? { code: code.toUpperCase() } : {}),
+        unitPrice: Number(codePrice[2]),
+      });
+    }
+  }
+  return results;
+}
+
+function matchDetailName(raw: string, names: string[]): string | undefined {
+  const needle = raw.trim();
+  return names.find((name) => namesMatch(name, needle));
+}
+
 export function parseColonPurchaseOrder(message: string): ParsePurchaseOrderResult {
   const lines = message
     .split(/\r?\n/)
@@ -160,9 +276,8 @@ export function parsePurchaseOrderLocal(message: string): ParsePurchaseOrderResu
 }
 
 export function isRestartCommand(text: string): boolean {
-  const trimmed = text.trim();
-  return /^(restart|cancel|start over|start again|new order|new po|stop|abort|nevermind|never mind)\s*!*$/i.test(
-    trimmed
+  return /^(restart|cancel|start over|start again|new order|new po|stop|abort|nevermind|never mind)$/i.test(
+    chatReplyKey(text)
   );
 }
 
@@ -171,15 +286,14 @@ export function looksLikeReconcileRequest(text: string): boolean {
 }
 
 export function looksLikeSupplierChange(text: string): boolean {
-  return /\b(change|switch|different|another|other)\s+suppliers?\b/i.test(text.trim());
+  return /\b(change|switch|different|another|other)\s+suppliers?\b/i.test(chatReplyKey(text));
 }
 
 export function looksLikeNewPurchaseOrder(text: string): boolean {
   const parsed = parsePurchaseOrderLocal(text);
   if (!parsed.isPurchaseOrder) return false;
-  if (parsed.items.length >= 2) return true;
-  const only = parsed.items[0];
-  return Boolean(only?.unit);
+  // Price-only replies like "Lady finger: 3.50" must not look like a new order.
+  return parsed.items.some((item) => Boolean(item.unit));
 }
 
 export interface MatchableLine {

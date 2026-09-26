@@ -6,6 +6,7 @@ import { organizationService } from "./organization.service.js";
 import { followUpService } from "./follow-up.service.js";
 import { getOrganizationId } from "../context/tenant.js";
 import { logWaiting } from "../utils/workflow-log.js";
+import { isAffirmativeReply } from "../utils/matching.js";
 
 export interface CreateApprovalInput {
   workflowRunId: string;
@@ -67,10 +68,7 @@ class ApprovalService {
     const approval = await prisma.approvalRequest.update({
       where: { id: approvalId },
       data: {
-        status:
-          response.toLowerCase() === "yes" || response.toLowerCase() === "approve"
-            ? ApprovalStatus.APPROVED
-            : ApprovalStatus.REJECTED,
+        status: isAffirmativeReply(response) ? ApprovalStatus.APPROVED : ApprovalStatus.REJECTED,
         response,
         respondedBy,
         resolvedAt: new Date(),

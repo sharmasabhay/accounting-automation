@@ -12,6 +12,7 @@ import { logger } from "../../utils/logger.js";
 import { logDone, logStep } from "../../utils/workflow-log.js";
 import { isXeroError, notifySupervisorOfXeroError } from "../../utils/xero-error.js";
 import type { PayableList } from "../../types/index.js";
+import { isReadyReply } from "../../utils/matching.js";
 import {
   asBillIds,
   billIdsOverlap,
@@ -142,7 +143,7 @@ export const paymentExecutionWorkflow = {
     gateType: ApprovalGateType,
     response: string
   ): Promise<void> {
-    if (gateType !== ApprovalGateType.DBS_STANDBY || response.toLowerCase() !== "ready") {
+    if (gateType !== ApprovalGateType.DBS_STANDBY || !isReadyReply(response)) {
       return;
     }
 

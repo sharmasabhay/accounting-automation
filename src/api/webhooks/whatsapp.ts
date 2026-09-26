@@ -13,7 +13,9 @@ import {
   isRestartCommand,
   looksLikeNewPurchaseOrder,
   looksLikeReconcileRequest,
+  normalizeChatReply,
 } from "../../utils/matching.js";
+import { ApprovalGateType } from "@prisma/client";
 import type { WhatsAppInboundMessage } from "../../types/index.js";
 
 interface RawWhatsAppMessage {
@@ -174,7 +176,7 @@ export async function processWhatsAppWebhook(
           organization.id,
           async () => {
             if (inbound.text) {
-              const response = inbound.text.trim();
+              const response = normalizeChatReply(inbound.text);
               const pendingApproval = await approvalService.findPendingForOrganization(
                 organization.id
               );
@@ -190,7 +192,12 @@ export async function processWhatsAppWebhook(
                   return { status: "restarted" as const, messageId: inbound.messageId };
                 }
 
-                if (looksLikeNewPurchaseOrder(response) || looksLikeReconcileRequest(response)) {
+                const waitingForItemDetails =
+                  pendingApproval.gateType === ApprovalGateType.NEW_PO_PRICE;
+                if (
+                  !waitingForItemDetails &&
+                  (looksLikeNewPurchaseOrder(response) || looksLikeReconcileRequest(response))
+                ) {
                   await approvalService.abandonPending(pendingApproval, "supervisor changed topic");
                   await whatsappService.sendText(
                     inbound.from,

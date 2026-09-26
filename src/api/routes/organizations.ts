@@ -170,10 +170,9 @@ export async function registerOrganizationRoutes(app: FastifyInstance): Promise<
     const { idOrSlug } = request.params as { idOrSlug: string };
     const body = request.body as {
       name: string;
-      emailDomain?: string;
-      xeroContactId?: string;
-      whatsappGroupId?: string;
-      dbsPayeeName?: string;
+      emailDomain?: string | null;
+      whatsappGroupId?: string | null;
+      dbsPayeeName?: string | null;
     };
 
     const organization = await organizationService.getByIdOrSlug(idOrSlug);
@@ -181,8 +180,23 @@ export async function registerOrganizationRoutes(app: FastifyInstance): Promise<
       return reply.code(404).send({ error: "Organization not found" });
     }
 
-    const supplier = await organizationService.addSupplier(organization.id, body);
-    return reply.code(201).send(supplier);
+    try {
+      const contact = await xeroService.ensureSupplierContact(organization.id, {
+        name: body.name,
+      });
+      const supplier = await organizationService.addSupplier(organization.id, {
+        name: body.name,
+        emailDomain: body.emailDomain,
+        whatsappGroupId: body.whatsappGroupId,
+        dbsPayeeName: body.dbsPayeeName,
+        xeroContactId: contact.contactId,
+      });
+      return reply.code(201).send({ ...supplier, xeroContactCreated: contact.created });
+    } catch (err) {
+      logger.error({ err, url: request.url }, "Supplier create failed");
+      const message = err instanceof Error ? err.message : "Create failed";
+      return reply.code(400).send({ error: message });
+    }
   });
 
   app.patch("/api/organizations/:idOrSlug/suppliers/:supplierId", async (request, reply) => {
@@ -193,7 +207,6 @@ export async function registerOrganizationRoutes(app: FastifyInstance): Promise<
     const body = request.body as {
       name?: string;
       emailDomain?: string | null;
-      xeroContactId?: string | null;
       whatsappGroupId?: string | null;
       dbsPayeeName?: string | null;
     };

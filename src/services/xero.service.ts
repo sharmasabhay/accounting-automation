@@ -3,7 +3,7 @@ import path from "node:path";
 import { prisma } from "../db/client.js";
 import { logger } from "../utils/logger.js";
 import { withRetry } from "../utils/storage.js";
-import { isWithinDaysBefore } from "../utils/matching.js";
+import { isWithinDaysBefore, namesMatch, suggestedItemCode, isPlausibleItemCode } from "../utils/matching.js";
 import { XeroApiError, notifySupervisorOfXeroError } from "../utils/xero-error.js";
 import { integrationConfigService } from "./integration-config.service.js";
 import type { XeroIntegrationConfig } from "../types/integrations.js";
@@ -77,12 +77,16 @@ interface XeroPurchaseOrderResponse {
   }>;
 }
 
+interface XeroContactRecord {
+  ContactID?: string;
+  Name?: string;
+  EmailAddress?: string;
+  IsSupplier?: boolean;
+  ContactStatus?: string;
+}
+
 interface XeroContactsResponse {
-  Contacts?: Array<{
-    ContactID?: string;
-    Name?: string;
-    EmailAddress?: string;
-  }>;
+  Contacts?: XeroContactRecord[];
 }
 
 interface XeroItemsResponse {
@@ -144,7 +148,8 @@ class XeroService {
       "accounting.contacts",
       "accounting.attachments",
       "accounting.invoices",
-      "accounting.payments",      
+      "accounting.payments",
+      "accounting.items",
       "accounting.settings",
       "accounting.settings.read"
     ];
@@ -246,6 +251,86 @@ class XeroService {
       }));
   }
 
+  async ensureSupplierContact(
+    organizationId: string,
+    input: { name: string; email?: string }
+  ): Promise<{ contactId: string; name: string; created: boolean }> {
+    const name = input.name.trim();
+    if (!name) {
+      throw new XeroApiError("Supplier name is required to create a Xero contact");
+    }
+    if (!(await this.isConfiguredForOrg(organizationId))) {
+      throw new XeroApiError(
+        "Xero is not connected for this organisation. Connect Xero in Admin → Integrations, then add the supplier."
+      );
+    }
+
+    const existing = await this.findContactByName(organizationId, name);
+    if (existing?.ContactID) {
+      if (existing.IsSupplier === false || existing.ContactStatus === "ARCHIVED") {
+        await this.xeroApiRequest<XeroContactsResponse>(organizationId, "POST", "/Contacts", {
+          Contacts: [
+            {
+              ContactID: existing.ContactID,
+              IsSupplier: true,
+              ...(existing.ContactStatus === "ARCHIVED" ? { ContactStatus: "ACTIVE" } : {}),
+            },
+          ],
+        });
+      }
+      logger.info(
+        { organizationId, name, contactId: existing.ContactID },
+        "Reusing existing Xero supplier contact"
+      );
+      return { contactId: existing.ContactID, name: existing.Name ?? name, created: false };
+    }
+
+    try {
+      const result = await this.xeroApiRequest<XeroContactsResponse>(organizationId, "POST", "/Contacts", {
+        Contacts: [
+          {
+            Name: name,
+            IsSupplier: true,
+            ...(input.email ? { EmailAddress: input.email } : {}),
+          },
+        ],
+      });
+      const created = result.Contacts?.[0];
+      if (!created?.ContactID) {
+        throw new XeroApiError("Xero did not return a contact ID after creating the supplier");
+      }
+      logger.info(
+        { organizationId, name, contactId: created.ContactID },
+        "Created Xero supplier contact"
+      );
+      return { contactId: created.ContactID, name: created.Name ?? name, created: true };
+    } catch (error) {
+      const retry = await this.findContactByName(organizationId, name);
+      if (retry?.ContactID) {
+        return { contactId: retry.ContactID, name: retry.Name ?? name, created: false };
+      }
+      throw error;
+    }
+  }
+
+  private async findContactByName(
+    organizationId: string,
+    name: string
+  ): Promise<XeroContactRecord | undefined> {
+    const escaped = name.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const where = encodeURIComponent(`Name=="${escaped}"`);
+    const result = await this.xeroApiRequest<XeroContactsResponse>(
+      organizationId,
+      "GET",
+      `/Contacts?where=${where}`
+    );
+    return (
+      result.Contacts?.find(
+        (contact) => contact.ContactID && contact.Name?.toLowerCase() === name.toLowerCase()
+      ) ?? result.Contacts?.find((contact) => Boolean(contact.ContactID))
+    );
+  }
+
   async listItems(organizationId: string): Promise<XeroItem[]> {
     if (!(await this.isConfiguredForOrg(organizationId))) {
       logger.info({ organizationId }, "Xero not connected — items list skipped");
@@ -274,6 +359,80 @@ class XeroService {
       if (batch.length < 100) break;
     }
     return items;
+  }
+
+  async ensurePurchaseItem(
+    organizationId: string,
+    input: { name: string; code?: string; unitPrice?: number }
+  ): Promise<XeroItem> {
+    const name = input.name.trim();
+    if (!name) {
+      throw new XeroApiError("Item name is required to create a Xero item");
+    }
+
+    const catalog = await this.listItems(organizationId);
+    const requested = input.code?.trim();
+    if (requested) {
+      const byCode = catalog.find(
+        (item) => item.code.toLowerCase() === requested.toLowerCase()
+      );
+      if (byCode) return byCode;
+    }
+    const byName = catalog.filter((item) => namesMatch(item.name, name));
+    if (byName.length === 1) return byName[0]!;
+
+    const baseCode = suggestedItemCode(requested || name);
+    let code = baseCode;
+    let suffix = 2;
+    const taken = new Set(catalog.map((item) => item.code.toUpperCase()));
+    while (taken.has(code.toUpperCase()) && suffix < 100) {
+      code = `${baseCode.slice(0, 28)}${suffix}`;
+      suffix += 1;
+    }
+
+    if (!(await this.isConfiguredForOrg(organizationId))) {
+      logger.info({ organizationId, name, code }, "Xero not connected — mock item created");
+      return { itemId: `DRY-ITEM-${code}`, code, name, purchaseUnitPrice: input.unitPrice };
+    }
+
+    const accountCode = await this.resolveExpenseAccountCode(organizationId);
+    try {
+      const result = await this.xeroApiRequest<XeroItemsResponse>(organizationId, "POST", "/Items", {
+        Items: [
+          {
+            Code: code,
+            Name: name.slice(0, 50),
+            Description: name,
+            IsPurchased: true,
+            PurchaseDetails: {
+              UnitPrice: input.unitPrice ?? 0,
+              AccountCode: accountCode,
+            },
+          },
+        ],
+      });
+      const created = result.Items?.[0];
+      if (!created?.ItemID) {
+        throw new XeroApiError("Xero did not return an item ID after creating the catalog item");
+      }
+      logger.info(
+        { organizationId, name, code: created.Code ?? code, itemId: created.ItemID },
+        "Created Xero purchase item"
+      );
+      return {
+        itemId: created.ItemID,
+        code: created.Code ?? code,
+        name: created.Name ?? name,
+        purchaseUnitPrice: input.unitPrice,
+      };
+    } catch (error) {
+      const retry = (await this.listItems(organizationId)).find(
+        (item) =>
+          item.code.toUpperCase() === code.toUpperCase() || namesMatch(item.name, name)
+      );
+      if (retry) return retry;
+      throw error;
+    }
   }
 
   private async isConfiguredForOrg(organizationId: string): Promise<boolean> {
@@ -530,7 +689,7 @@ class XeroService {
 
     if (!contactName) {
       throw new XeroApiError(
-        "Supplier has no Xero Contact ID — set xeroContactId in Admin → Suppliers (UUID from Xero)"
+        "Supplier has no Xero contact yet. Add the supplier again in Admin so a Xero contact is created."
       );
     }
 
@@ -544,7 +703,7 @@ class XeroService {
     const contact = result.Contacts?.[0];
     if (!contact?.ContactID) {
       throw new XeroApiError(
-        `No Xero contact found for supplier "${contactName}". Create the supplier in Xero or set xeroContactId.`
+        `No Xero contact found for supplier "${contactName}". Add the supplier in Admin so a Xero contact is created.`
       );
     }
 
@@ -644,7 +803,7 @@ class XeroService {
           Description: line.description,
           Quantity: line.quantity,
           UnitAmount: line.unitAmount,
-          ...(line.itemCode ? { ItemCode: line.itemCode } : {}),
+          ...(line.itemCode && isPlausibleItemCode(line.itemCode) ? { ItemCode: line.itemCode } : {}),
         })),
         Status: "AUTHORISED",
       };
@@ -716,7 +875,7 @@ class XeroService {
                 Description: line.description,
                 Quantity: line.quantity,
                 UnitAmount: line.unitAmount,
-                ...(line.itemCode ? { ItemCode: line.itemCode } : {}),
+                ...(line.itemCode && isPlausibleItemCode(line.itemCode) ? { ItemCode: line.itemCode } : {}),
               })),
               Status: "AUTHORISED",
             },
@@ -780,7 +939,7 @@ class XeroService {
           Quantity: line.quantity,
           UnitAmount: line.unitAmount,
           AccountCode: expenseCode,
-          ...(line.itemCode ? { ItemCode: line.itemCode } : {}),
+          ...(line.itemCode && isPlausibleItemCode(line.itemCode) ? { ItemCode: line.itemCode } : {}),
         }))
         .filter((line) => line.Description && line.Quantity > 0);
       if (!lineItems.length) {

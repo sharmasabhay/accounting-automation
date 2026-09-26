@@ -13,7 +13,7 @@ import { paymentExecutionWorkflow } from "../workflows/payment-execution/index.j
 import { progressService } from "../services/progress.service.js";
 import { withOrganization } from "../context/tenant.js";
 import { saveUploadedFile } from "../utils/storage.js";
-import { isSoaDocument } from "../utils/matching.js";
+import { isSoaDocument, isReadyReply } from "../utils/matching.js";
 import type { WorkflowEvent, WhatsAppInboundMessage, SavedEmailAttachment } from "../types/index.js";
 import { logger } from "../utils/logger.js";
 import { logStep } from "../utils/workflow-log.js";
@@ -327,7 +327,7 @@ function describeWhatsAppWork(message: WhatsAppInboundMessage): string {
 }
 
 function describeApprovalWork(type: WorkflowType, gateType: ApprovalGateType, response: string): string {
-  if (gateType === ApprovalGateType.DBS_STANDBY || response.toLowerCase() === "ready") {
+  if (gateType === ApprovalGateType.DBS_STANDBY || isReadyReply(response)) {
     return "the DBS payment";
   }
   if (type === WorkflowType.RECONCILIATION) return "reconciliation";

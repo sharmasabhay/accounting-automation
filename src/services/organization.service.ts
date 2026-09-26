@@ -1,6 +1,27 @@
-import { IntegrationType, TeamMemberRole, type Organization, type Prisma } from "@prisma/client";
+import { IntegrationType, Prisma, TeamMemberRole, type Organization } from "@prisma/client";
 import { prisma } from "../db/client.js";
 import type { WhatsAppInboundMessage } from "../types/index.js";
+
+function optionalText(value?: string | null): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function mapSupplierWriteError(error: unknown): Error {
+  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+    const fields = error.meta?.target;
+    const target = Array.isArray(fields) ? fields.join(",") : String(fields ?? "");
+    if (target.includes("whatsapp_group_id") || target.includes("whatsappGroupId")) {
+      return new Error(
+        "This WhatsApp group is already linked to another supplier. Leave the group ID blank unless this supplier has its own group."
+      );
+    }
+    return new Error("A supplier with these details already exists.");
+  }
+  return error instanceof Error ? error : new Error(String(error));
+}
 
 export interface CreateOrganizationInput {
   name: string;
@@ -17,10 +38,10 @@ export interface CreateTeamMemberInput {
 
 export interface CreateSupplierInput {
   name: string;
-  emailDomain?: string;
-  xeroContactId?: string;
-  whatsappGroupId?: string;
-  dbsPayeeName?: string;
+  emailDomain?: string | null;
+  xeroContactId?: string | null;
+  whatsappGroupId?: string | null;
+  dbsPayeeName?: string | null;
 }
 
 export interface UpdateSupplierInput {
@@ -100,16 +121,43 @@ class OrganizationService {
   }
 
   async addSupplier(organizationId: string, input: CreateSupplierInput) {
-    return prisma.supplier.create({
-      data: {
-        organizationId,
-        name: input.name,
-        emailDomain: input.emailDomain,
-        xeroContactId: input.xeroContactId,
-        whatsappGroupId: input.whatsappGroupId,
-        dbsPayeeName: input.dbsPayeeName,
-      },
-    });
+    const name = input.name?.trim();
+    if (!name) {
+      throw new Error("Name is required");
+    }
+
+    const data = {
+      name,
+      emailDomain: optionalText(input.emailDomain) ?? null,
+      xeroContactId: optionalText(input.xeroContactId) ?? null,
+      whatsappGroupId: optionalText(input.whatsappGroupId) ?? null,
+      dbsPayeeName: optionalText(input.dbsPayeeName) ?? null,
+    };
+
+    if (data.whatsappGroupId) {
+      const existing = await prisma.supplier.findFirst({
+        where: { organizationId, whatsappGroupId: data.whatsappGroupId },
+      });
+      if (existing?.isActive) {
+        throw new Error(
+          "This WhatsApp group is already linked to another supplier. Leave the group ID blank unless this supplier has its own group."
+        );
+      }
+      if (existing) {
+        return prisma.supplier.update({
+          where: { id: existing.id },
+          data: { ...data, isActive: true },
+        });
+      }
+    }
+
+    try {
+      return await prisma.supplier.create({
+        data: { organizationId, ...data },
+      });
+    } catch (error) {
+      throw mapSupplierWriteError(error);
+    }
   }
 
   async removeSupplier(organizationId: string, supplierId: string) {
@@ -123,7 +171,7 @@ class OrganizationService {
 
     return prisma.supplier.update({
       where: { id: supplierId },
-      data: { isActive: false },
+      data: { isActive: false, whatsappGroupId: null },
     });
   }
 
@@ -143,29 +191,33 @@ class OrganizationService {
     const data: Prisma.SupplierUpdateInput = {};
 
     if (input.name !== undefined) {
-      const name = input.name.trim();
+      const name = input.name?.trim() ?? "";
       if (!name) {
         throw new Error("Name is required");
       }
       data.name = name;
     }
     if (input.emailDomain !== undefined) {
-      data.emailDomain = input.emailDomain?.trim() || null;
+      data.emailDomain = optionalText(input.emailDomain) ?? null;
     }
     if (input.xeroContactId !== undefined) {
-      data.xeroContactId = input.xeroContactId?.trim() || null;
+      data.xeroContactId = optionalText(input.xeroContactId) ?? null;
     }
     if (input.whatsappGroupId !== undefined) {
-      data.whatsappGroupId = input.whatsappGroupId?.trim() || null;
+      data.whatsappGroupId = optionalText(input.whatsappGroupId) ?? null;
     }
     if (input.dbsPayeeName !== undefined) {
-      data.dbsPayeeName = input.dbsPayeeName?.trim() || null;
+      data.dbsPayeeName = optionalText(input.dbsPayeeName) ?? null;
     }
 
-    return prisma.supplier.update({
-      where: { id: supplierId },
-      data,
-    });
+    try {
+      return await prisma.supplier.update({
+        where: { id: supplierId },
+        data,
+      });
+    } catch (error) {
+      throw mapSupplierWriteError(error);
+    }
   }
 
   async importSuppliersFromXero(

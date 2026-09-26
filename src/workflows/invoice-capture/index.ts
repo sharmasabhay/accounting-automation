@@ -17,6 +17,8 @@ import {
   namedPoFromInvoice,
   poNumbersMatch,
   selectInvoicePurchaseOrder,
+  isAffirmativeReply,
+  isNegativeReply,
   type InvoicePoCandidate,
 } from "../../utils/matching.js";
 import { hasCoreInvoiceFields } from "../../utils/invoice-parse.js";
@@ -634,11 +636,10 @@ export const invoiceCaptureWorkflow = {
       await this.failRun(workflowRunId, "Missing payload on approval");
       return;
     }
-    const lower = response.trim().toLowerCase();
 
     if (gateType === ApprovalGateType.FIELD_CONFIRMATION) {
       if (payload.poChoices?.length) {
-        if (lower === "no") {
+        if (isNegativeReply(response)) {
           await this.failRun(workflowRunId, "PO choice declined");
           return;
         }
@@ -662,11 +663,11 @@ export const invoiceCaptureWorkflow = {
         await this.continueAfterExtraction(workflowRunId);
         return;
       }
-      if (lower === "no") {
+      if (isNegativeReply(response)) {
         await this.failRun(workflowRunId, "Field confirmation rejected");
         return;
       }
-      if (lower !== "yes") {
+      if (!isAffirmativeReply(response)) {
         const invoiceUnknown =
           payload.extraction.invoiceNumber.value.trim().toLowerCase() === "unknown" ||
           payload.extraction.invoiceNumber.confidence < CONFIDENCE_THRESHOLD;
@@ -723,7 +724,7 @@ export const invoiceCaptureWorkflow = {
     }
 
     if (gateType === ApprovalGateType.CREATE_PO_FROM_INVOICE) {
-      if (lower !== "yes") {
+      if (!isAffirmativeReply(response)) {
         await this.failRun(workflowRunId, "Retrospective PO declined");
         return;
       }
@@ -770,7 +771,7 @@ export const invoiceCaptureWorkflow = {
     }
 
     if (gateType === ApprovalGateType.DISCREPANCY_RESOLUTION) {
-      if (lower !== "yes") {
+      if (!isAffirmativeReply(response)) {
         await this.failRun(workflowRunId, "Discrepancy not approved");
         return;
       }
@@ -786,7 +787,7 @@ export const invoiceCaptureWorkflow = {
     }
 
     if (gateType === ApprovalGateType.ORDER_RECEIVED_CONFIRMATION) {
-      if (lower !== "yes") {
+      if (!isAffirmativeReply(response)) {
         await this.failRun(workflowRunId, "Goods received not confirmed");
         return;
       }

@@ -230,7 +230,7 @@ function openEditSupplier(supplierId) {
   const form = document.getElementById("edit-supplier-form");
   document.getElementById("edit-supplier-id").value = supplier.id;
 
-  for (const field of ["name", "emailDomain", "whatsappGroupId", "dbsPayeeName", "xeroContactId"]) {
+  for (const field of ["name", "emailDomain", "whatsappGroupId", "dbsPayeeName"]) {
     const input = form.querySelector(`[name="${field}"]`);
     if (input) input.value = supplier[field] || "";
   }
@@ -840,8 +840,17 @@ function initForms() {
     e.preventDefault();
     const fd = new FormData(e.target);
     try {
-      await api.addSupplier(currentOrg.slug, Object.fromEntries(fd.entries()));
-      showToast("Supplier added");
+      const created = await api.addSupplier(currentOrg.slug, {
+        name: fd.get("name"),
+        emailDomain: fd.get("emailDomain") || null,
+        whatsappGroupId: fd.get("whatsappGroupId") || null,
+        dbsPayeeName: fd.get("dbsPayeeName") || null,
+      });
+      showToast(
+        created?.xeroContactCreated === false
+          ? "Supplier added (matched existing Xero contact)"
+          : "Supplier added in Xero"
+      );
       await refreshSuppliers();
       e.target.reset();
     } catch (err) {
@@ -858,7 +867,6 @@ function initForms() {
     const body = {
       name: fd.get("name"),
       emailDomain: fd.get("emailDomain") || null,
-      xeroContactId: fd.get("xeroContactId") || null,
       whatsappGroupId: fd.get("whatsappGroupId") || null,
       dbsPayeeName: fd.get("dbsPayeeName") || null,
     };

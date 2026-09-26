@@ -23,6 +23,8 @@ import {
   getPreviousMonth,
   parseReconcilePeriod,
   matchSupplierNameInText,
+  isNegativeReply,
+  chatReplyKey,
 } from "../../utils/matching.js";
 import { logDone, logStep } from "../../utils/workflow-log.js";
 import { notifySupervisorOfXeroError } from "../../utils/xero-error.js";
@@ -541,7 +543,7 @@ export const reconciliationWorkflow = {
       await this.finish(workflowRunId, WorkflowStatus.FAILED);
       return;
     }
-    const lower = response.trim().toLowerCase();
+    const lower = chatReplyKey(response);
 
     if (gateType === ApprovalGateType.FIELD_CONFIRMATION) {
       const period = parseReconcilePeriod(response);
@@ -565,7 +567,7 @@ export const reconciliationWorkflow = {
     }
 
     if (gateType === ApprovalGateType.NEW_SOA_DETECTION) {
-      if (lower === "no") {
+      if (isNegativeReply(response)) {
         await this.finish(workflowRunId, WorkflowStatus.CANCELLED);
         return;
       }

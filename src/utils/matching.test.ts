@@ -19,6 +19,12 @@ import {
   isRestartCommand,
   looksLikeNewPurchaseOrder,
   looksLikeSupplierChange,
+  isAffirmativeReply,
+  isNegativeReply,
+  isReadyReply,
+  normalizeChatReply,
+  parsePoItemDetailsReply,
+  suggestedItemCode,
 } from "./matching.js";
 
 describe("PO parse", () => {
@@ -45,10 +51,49 @@ describe("PO parse", () => {
 
   it("treats a restated order as a new PO, not an approval answer", () => {
     assert.equal(looksLikeNewPurchaseOrder("Apple 10kg, banana 5kg"), true);
+    assert.equal(looksLikeNewPurchaseOrder("Bok choy 2kg, Pepper 5kg"), true);
     assert.equal(looksLikeNewPurchaseOrder("3.50"), false);
     assert.equal(looksLikeNewPurchaseOrder("yes"), false);
+    assert.equal(looksLikeNewPurchaseOrder("Lady finger: 3.50\nRed pepper: 4"), false);
     assert.equal(isRestartCommand("restart"), true);
     assert.equal(looksLikeSupplierChange("change supplier"), true);
+    assert.equal(looksLikeSupplierChange("*change supplier*"), true);
+    assert.equal(isRestartCommand("*restart*"), true);
+    assert.equal(isAffirmativeReply("yes"), true);
+    assert.equal(isAffirmativeReply("*yes*"), true);
+    assert.equal(isAffirmativeReply("YES"), true);
+    assert.equal(isAffirmativeReply("yes!"), true);
+    assert.equal(isNegativeReply("*no*"), true);
+    assert.equal(isReadyReply("*ready*"), true);
+    assert.equal(normalizeChatReply("*yes*"), "yes");
+  });
+});
+
+describe("PO item details reply", () => {
+  it("parses one price per new item", () => {
+    const result = parsePoItemDetailsReply(
+      "Bok choy: 3.50\nZucchini: 4",
+      ["Bok choy", "Zucchini"]
+    );
+    assert.equal(result.length, 2);
+    assert.equal(result[0]?.unitPrice, 3.5);
+    assert.equal(result[1]?.itemName, "Zucchini");
+  });
+
+  it("parses item code plus price", () => {
+    const result = parsePoItemDetailsReply("Bok choy: BOKCHOY 5", ["Bok choy"]);
+    assert.equal(result[0]?.code, "BOKCHOY");
+    assert.equal(result[0]?.unitPrice, 5);
+  });
+
+  it("assigns numbered lines in order", () => {
+    const result = parsePoItemDetailsReply("3.50\n4.00", ["Bok choy", "Zucchini"]);
+    assert.equal(result[0]?.unitPrice, 3.5);
+    assert.equal(result[1]?.unitPrice, 4);
+  });
+
+  it("builds a compact Xero item code from the name", () => {
+    assert.equal(suggestedItemCode("Bok choy"), "BOKCHOY");
   });
 });
 
