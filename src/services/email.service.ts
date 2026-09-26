@@ -262,9 +262,14 @@ class EmailService {
       } catch {
         /* already exists */
       }
-      const found =
-        uid ??
-        (await client.search({ header: ["Message-ID", messageId] }, { uid: true }))?.[0];
+      let found = uid;
+      if (found == null) {
+        const matches = await client.search(
+          { header: { "Message-ID": messageId } },
+          { uid: true }
+        );
+        found = Array.isArray(matches) ? matches[0] : undefined;
+      }
       if (found == null) return;
       await client.messageMove(String(found), processed, { uid: true });
     } catch (error) {
